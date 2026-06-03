@@ -31,8 +31,8 @@ between bindings definitions.
 
 The `wit-bindgen` repository is currently focused on **guest** programs which
 are those compiled to WebAssembly. Languages developed in this repository are
-Rust, C, C++, C#, and Go. For other languages see the [documentation
-below](#guest-other-languages).
+Rust, C, C++, C#, Go, MoonBit, and AssemblyScript. For other languages see the
+[documentation below](#guest-other-languages).
 
 Executing a component in a host is not
 managed in this repository, and some options of how to do so are [described
@@ -388,6 +388,58 @@ optional, string, string_view, vector, expected to represent generic
 WIT types.
 
 This relies on wasi-SDK for guest compilation.
+
+### Guest: AssemblyScript
+
+[AssemblyScript](https://www.assemblyscript.org/) is a TypeScript-syntax language
+that compiles directly to WebAssembly. Install the toolchain with npm:
+
+```sh
+npm install -g assemblyscript
+```
+
+Generate bindings for a `.wit` directory:
+
+```sh
+wit-bindgen assemblyscript ./wit --out-dir bindings
+```
+
+This produces, under `bindings/`:
+
+* `bindings.ts` — the entry file passed to `asc`. Re-exports the wasm exports.
+* `imports/<wit-pkg>$<iface>.ts` — host import declarations and call helpers per
+  imported interface.
+* `exports/<wit-pkg>$<iface>.ts` — initial stubs for exported interfaces. **Edit
+  these** to implement your component; re-run the generator with `--ignore-stub`
+  on subsequent runs to preserve your changes.
+* `ffi.ts` — shared FFI helpers (`cabi_realloc`, string/list lift+lower,
+  return-area buffer).
+* `asconfig.json` — `asc` target configuration.
+
+Build the component:
+
+```sh
+cd bindings
+asc bindings.ts --target release
+wasm-tools component embed --encoding utf16 -w <world-name> ../wit core.wasm -o embedded.wasm
+wasm-tools component new -o my-component.wasm embedded.wasm
+```
+
+#### AssemblyScript notes
+
+* **String encoding is UTF-16**, matching AS's native `String` layout. The
+  `wasm-tools component embed --encoding utf16` flag is required.
+* **Two runtimes are supported**: `--runtime incremental` (default; full GC,
+  recommended for most components) and `--runtime minimal` (smaller binary,
+  requires manual `__collect()` for long-running workloads).
+* **Resources** use explicit `.drop()` — AS has no finalizer mechanism, so the
+  user must call `drop()` when done with an imported resource handle. Exported
+  resources can implement an optional `__onDrop()` hook called by the generated
+  destructor.
+* **Async**, `future<T>`, `stream<T>`, and `error-context` are not yet
+  implemented. Functions marked `async` in WIT generate stub bodies that trap
+  (`unreachable()`). `future`/`stream`/`error-context` types become opaque `i32`
+  handle aliases — sync code that just shuttles these handles works correctly.
 
 ### Guest: MoonBit
 
