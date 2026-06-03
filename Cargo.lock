@@ -1371,6 +1371,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wit-bindgen-assemblyscript"
+version = "0.60.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "heck",
+ "wit-bindgen-core",
+]
+
+[[package]]
 name = "wit-bindgen-c"
 version = "0.60.0"
 dependencies = [
@@ -1392,6 +1402,7 @@ dependencies = [
  "clap",
  "env_logger",
  "wasm-encoder 0.254.0",
+ "wit-bindgen-assemblyscript",
  "wit-bindgen-c",
  "wit-bindgen-core",
  "wit-bindgen-cpp",
