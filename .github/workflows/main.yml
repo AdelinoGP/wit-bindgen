@@ -79,7 +79,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         # moonbit removed from language matrix for now - causing CI failures
-        lang: [c, rust, csharp, cpp, go]
+        lang: [c, rust, csharp, cpp, go, assemblyscript]
         exclude:
           # For now csharp doesn't work on macos, so exclude it from testing.
           - os: macos-latest
@@ -135,6 +135,14 @@ jobs:
       shell: powershell
       if: matrix.os == 'windows-latest' && matrix.lang == 'moonbit'
 
+    - name: Setup Node + AssemblyScript
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+      if: matrix.lang == 'assemblyscript'
+    - run: npm install -g assemblyscript
+      if: matrix.lang == 'assemblyscript'
+
     # Run all codegen tests for this language
     - run: |
         cargo run test --languages ${{ matrix.lang }} tests/codegen \
@@ -145,6 +153,34 @@ jobs:
     # this language only implements either the runner or test component
     - run: |
         cargo run test --languages rust,c,${{ matrix.lang }} tests/runtime \
+          --artifacts target/artifacts \
+          --rust-wit-bindgen-path ./crates/guest-rust
+
+  # Single Ubuntu smoke run with AssemblyScript's `minimal` runtime variant. The
+  # default test job above covers `incremental` across all three OSes; this catches
+  # FFI-shim references to incremental-only runtime symbols.
+  test_assemblyscript_minimal:
+    name: Test AssemblyScript (minimal runtime)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+    - name: Install Rust
+      run: rustup update stable --no-self-update && rustup default stable
+    - run: rustup target add wasm32-wasip1 wasm32-wasip2
+    - uses: ./.github/actions/install-wasi-sdk
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+    - run: npm install -g assemblyscript
+
+    - run: |
+        WIT_BINDGEN_AS_RUNTIME=minimal cargo run test --languages assemblyscript tests/codegen \
+          --artifacts target/artifacts \
+          --rust-wit-bindgen-path ./crates/guest-rust
+    - run: |
+        WIT_BINDGEN_AS_RUNTIME=minimal cargo run test --languages rust,assemblyscript tests/runtime \
           --artifacts target/artifacts \
           --rust-wit-bindgen-path ./crates/guest-rust
 
