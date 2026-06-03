@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use wasm_encoder::{Encode, Section};
 use wit_component::{ComponentEncoder, StringEncoding};
 
+mod assemblyscript;
 mod c;
 mod config;
 mod cpp;
@@ -229,6 +230,7 @@ enum Language {
     Csharp,
     MoonBit,
     Go,
+    AssemblyScript,
     Custom(custom::Language),
 }
 
@@ -451,6 +453,7 @@ impl Runner {
             "cs" => Language::Csharp,
             "mbt" => Language::MoonBit,
             "go" => Language::Go,
+            "ts" => Language::AssemblyScript,
             other => Language::Custom(custom::Language::lookup(self, other)?),
         };
 
@@ -1323,6 +1326,7 @@ impl Language {
         Language::Csharp,
         Language::MoonBit,
         Language::Go,
+        Language::AssemblyScript,
     ];
 
     fn obj(&self) -> &dyn LanguageMethods {
@@ -1334,6 +1338,7 @@ impl Language {
             Language::Csharp => &csharp::Csharp,
             Language::MoonBit => &moonbit::MoonBit,
             Language::Go => &go::Go,
+            Language::AssemblyScript => &assemblyscript::AssemblyScript,
             Language::Custom(custom) => custom,
         }
     }
