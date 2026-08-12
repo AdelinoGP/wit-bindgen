@@ -2,7 +2,6 @@ use crate::{Compile, LanguageMethods, Runner, Verify};
 use anyhow::{Context as _, Result, bail};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::Path;
 use std::process::Command;
 
 pub struct AssemblyScript;
@@ -29,6 +28,7 @@ impl LanguageMethods for AssemblyScript {
 
     fn should_fail_verify(
         &self,
+        _runner: &Runner,
         _name: &str,
         config: &crate::config::WitConfig,
         _args: &[String],
@@ -42,7 +42,10 @@ impl LanguageMethods for AssemblyScript {
 
     fn prepare(&self, runner: &mut Runner) -> Result<()> {
         println!("Testing if the AssemblyScript toolchain (`asc`) is installed...");
-        if runner.run_command(Command::new(asc_binary()).arg("--version")).is_err() {
+        if runner
+            .run_command(Command::new(asc_binary()).arg("--version"))
+            .is_err()
+        {
             bail!(
                 "AssemblyScript compiler `asc` not found on PATH. \
                  Install it with `npm i -g assemblyscript`."
@@ -65,9 +68,8 @@ impl LanguageMethods for AssemblyScript {
         if !cfg.path.is_empty() {
             let dest = compile.bindings_dir.join(&cfg.path);
             if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent).with_context(|| {
-                    format!("unable to create `{}`", parent.display())
-                })?;
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("unable to create `{}`", parent.display()))?;
             }
             std::fs::copy(&compile.component.path, &dest).with_context(|| {
                 format!(
@@ -81,8 +83,8 @@ impl LanguageMethods for AssemblyScript {
         // Run asc, driven by the generated asconfig.json. `WIT_BINDGEN_AS_RUNTIME`
         // (env var) selects `incremental` vs `minimal`; default `incremental`.
         let core_wasm = compile.bindings_dir.join("core.wasm");
-        let runtime = std::env::var("WIT_BINDGEN_AS_RUNTIME")
-            .unwrap_or_else(|_| "incremental".into());
+        let runtime =
+            std::env::var("WIT_BINDGEN_AS_RUNTIME").unwrap_or_else(|_| "incremental".into());
         let mut cmd = Command::new(asc_binary());
         cmd.arg("bindings.ts")
             .arg("--target")
@@ -97,9 +99,8 @@ impl LanguageMethods for AssemblyScript {
         // Rewrite wasm export-section names from AS identifiers to the
         // canonical WIT names recorded in wit_bindgen_exports.json.
         let rename_json = compile.bindings_dir.join("wit_bindgen_exports.json");
-        let rename_src = std::fs::read_to_string(&rename_json).with_context(|| {
-            format!("unable to read `{}`", rename_json.display())
-        })?;
+        let rename_src = std::fs::read_to_string(&rename_json)
+            .with_context(|| format!("unable to read `{}`", rename_json.display()))?;
         let renames: HashMap<String, String> = serde_json::from_str(&rename_src)
             .context("failed to parse wit_bindgen_exports.json")?;
         let raw_wasm = std::fs::read(&core_wasm)?;
@@ -136,7 +137,8 @@ impl LanguageMethods for AssemblyScript {
                 .arg("bindings.ts")
                 .arg("--noEmit")
                 .current_dir(verify.bindings_dir),
-        )
+        )?;
+        Ok(())
     }
 }
 
@@ -146,17 +148,11 @@ fn asc_binary() -> &'static str {
     if cfg!(windows) { "asc.cmd" } else { "asc" }
 }
 
-#[allow(dead_code)]
-fn _path_marker(_p: &Path) {}
-
 /// Rewrite the wasm export section, renaming any export whose name is a key in
 /// `renames` to the corresponding value. All other sections pass through
 /// untouched. Used to bridge the gap between asc's identifier-only export names
 /// and the canonical WIT names (e.g. `foo:foo/records#tuple-arg`).
-fn rewrite_export_names(
-    wasm: &[u8],
-    renames: &HashMap<String, String>,
-) -> Result<Vec<u8>> {
+fn rewrite_export_names(wasm: &[u8], renames: &HashMap<String, String>) -> Result<Vec<u8>> {
     use wasm_encoder::{ExportKind, ExportSection, Module, RawSection};
     use wasmparser::{ExternalKind, Parser, Payload};
 

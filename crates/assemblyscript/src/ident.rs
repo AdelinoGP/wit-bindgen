@@ -14,21 +14,104 @@ use heck::{ToLowerCamelCase, ToUpperCamelCase};
 /// locals, function names).
 const RESERVED: &[&str] = &[
     // ES + TS keywords
-    "abstract", "any", "as", "async", "await", "boolean", "break", "case", "catch",
-    "class", "const", "constructor", "continue", "debugger", "declare", "default",
-    "delete", "do", "else", "enum", "export", "extends", "false", "finally", "for",
-    "from", "function", "get", "if", "implements", "import", "in", "infer",
-    "instanceof", "interface", "is", "keyof", "let", "module", "namespace",
-    "never", "new", "null", "number", "object", "of", "package", "private",
-    "protected", "public", "readonly", "require", "return", "set", "static",
-    "string", "super", "switch", "symbol", "this", "throw", "true", "try", "type",
-    "typeof", "undefined", "unique", "unknown", "var", "void", "while", "with",
+    "abstract",
+    "any",
+    "as",
+    "async",
+    "await",
+    "boolean",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "constructor",
+    "continue",
+    "debugger",
+    "declare",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "enum",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "from",
+    "function",
+    "get",
+    "if",
+    "implements",
+    "import",
+    "in",
+    "infer",
+    "instanceof",
+    "interface",
+    "is",
+    "keyof",
+    "let",
+    "module",
+    "namespace",
+    "never",
+    "new",
+    "null",
+    "number",
+    "object",
+    "of",
+    "package",
+    "private",
+    "protected",
+    "public",
+    "readonly",
+    "require",
+    "return",
+    "set",
+    "static",
+    "string",
+    "super",
+    "switch",
+    "symbol",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "type",
+    "typeof",
+    "undefined",
+    "unique",
+    "unknown",
+    "var",
+    "void",
+    "while",
+    "with",
     "yield",
     // AS-specific
-    "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "isize", "usize",
-    "f32", "f64", "bool", "v128", "anyref", "externref",
+    "i8",
+    "u8",
+    "i16",
+    "u16",
+    "i32",
+    "u32",
+    "i64",
+    "u64",
+    "isize",
+    "usize",
+    "f32",
+    "f64",
+    "bool",
+    "v128",
+    "anyref",
+    "externref",
     // AS globals we generate, plus a defensive list of frequently-used builtins
-    "abort", "load", "store", "memory", "heap", "changetype", "unreachable",
+    "abort",
+    "load",
+    "store",
+    "memory",
+    "heap",
+    "changetype",
+    "unreachable",
     "global",
 ];
 
@@ -45,7 +128,12 @@ pub fn value_name(wit: &str) -> String {
     if is_reserved(&out) {
         out.push('_');
     }
-    if out.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+    if out
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false)
+    {
         out.insert(0, '_');
     }
     out
@@ -60,7 +148,12 @@ pub fn type_name(wit: &str) -> String {
     if is_reserved(&out) {
         out.push('_');
     }
-    if out.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+    if out
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false)
+    {
         out.insert(0, '_');
     }
     out
@@ -85,7 +178,12 @@ pub fn iface_basename(raw: &str) -> String {
             _ => out.push('_'),
         }
     }
-    if out.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+    if out
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false)
+    {
         out.insert(0, '_');
     }
     out
@@ -117,6 +215,9 @@ mod tests {
     #[test]
     fn iface_basename_uses_dollar_separators() {
         assert_eq!(iface_basename("wasi:io/streams"), "wasi$io$streams");
-        assert_eq!(iface_basename("wasi:io/streams@0.2.0"), "wasi$io$streams$0_2_0");
+        assert_eq!(
+            iface_basename("wasi:io/streams@0.2.0"),
+            "wasi$io$streams$0_2_0"
+        );
     }
 }
