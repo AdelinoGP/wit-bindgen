@@ -180,7 +180,7 @@ jobs:
           --artifacts target/artifacts \
           --rust-wit-bindgen-path ./crates/guest-rust
     - run: |
-        WIT_BINDGEN_AS_RUNTIME=minimal cargo run test --languages rust,assemblyscript tests/runtime \
+        WIT_BINDGEN_AS_RUNTIME=minimal cargo run test --languages rust,c,assemblyscript tests/runtime \
           --artifacts target/artifacts \
           --rust-wit-bindgen-path ./crates/guest-rust
 

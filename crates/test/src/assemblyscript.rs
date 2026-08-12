@@ -30,14 +30,12 @@ impl LanguageMethods for AssemblyScript {
         &self,
         _runner: &Runner,
         _name: &str,
-        config: &crate::config::WitConfig,
+        _config: &crate::config::WitConfig,
         _args: &[String],
     ) -> bool {
-        // The AS backend stubs out async functions with `unreachable()` and
-        // emits opaque i32 typedefs for future<T>/stream<T>/error-context.
-        // Tests whose WIT is marked async are expected-fail until a future PR
-        // implements the AsyncCallback ABI.
-        config.async_ || config.error_context
+        // Verification only type-checks the generated source. Unsupported
+        // async functions and opaque async types are still valid AS syntax.
+        false
     }
 
     fn prepare(&self, runner: &mut Runner) -> Result<()> {

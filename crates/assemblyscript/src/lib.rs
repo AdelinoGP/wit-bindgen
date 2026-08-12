@@ -146,6 +146,10 @@ pub struct AssemblyScript {
     world_imports: InterfaceFragment,
     world_exports: InterfaceFragment,
 
+    /// Camel-cased names of freestanding functions exported by the world.
+    /// Used to avoid source-level collisions with same-named imports.
+    world_export_names: BTreeSet<String>,
+
     /// Wasm-export entries collected during export processing. Keyed by canonical
     /// wasm export name; value contains the AS function + body to inline into
     /// `bindings.ts`.
@@ -190,10 +194,20 @@ impl WorldGenerator for AssemblyScript {
     fn import_funcs(
         &mut self,
         resolve: &Resolve,
-        _world: WorldId,
+        world: WorldId,
         funcs: &[(&str, &Function)],
         _files: &mut Files,
     ) {
+        self.world_export_names = resolve.worlds[world]
+            .exports
+            .iter()
+            .filter_map(|(key, item)| match (key, item) {
+                (WorldKey::Name(name), wit_bindgen_core::wit_parser::WorldItem::Function(_)) => {
+                    Some(ident::value_name(name))
+                }
+                _ => None,
+            })
+            .collect();
         let mut r#gen = InterfaceGenerator::new(self, resolve, None, None, Direction::Import);
         for (_, func) in funcs {
             r#gen.gen_import_function(func);
@@ -752,6 +766,13 @@ impl<'a> InterfaceGenerator<'a> {
         // `[method]Foo.bar`, `[static]Foo.bar`, `[constructor]Foo` flow through
         // the same code path; we just unwrap their resource ID for naming.
         let func_local = Self::func_ident(&func.name);
+        let wrapper_name = if self.interface.is_none()
+            && self.world_gen.world_export_names.contains(&func_local)
+        {
+            format!("__import_{func_local}")
+        } else {
+            func_local.clone()
+        };
         let raw_extern_name = func.name.clone();
         let wasm_module = self.wasm_import_module(func);
         let mangled_extern = format!("__ext_{}", sanitize_extern_local(&func_local));
@@ -798,7 +819,7 @@ impl<'a> InterfaceGenerator<'a> {
 
         // Friendly wrapper: lifts args from AS values into wasm types, calls
         // the import, lifts results back.
-        let wrapper = sig.wrapper_signature(&func_local);
+        let wrapper = sig.wrapper_signature(&wrapper_name);
         writeln!(self.src, "export function {wrapper} {{").unwrap();
         if is_async {
             writeln!(self.src, "  unreachable();").unwrap();
