@@ -2386,10 +2386,17 @@ impl<'a, B: Bindgen> Generator<'a, B> {
             | Type::U64
             | Type::S64
             | Type::F32
-            | Type::F64
-            | Type::ErrorContext => {
+            | Type::F64 => {
                 // No deallocation necessary, just discard the operand on the
                 // stack.
+                self.stack.pop().unwrap();
+            }
+
+            Type::ErrorContext if what.handles() => {
+                self.lift(ty);
+                self.emit(&DropHandle { ty });
+            }
+            Type::ErrorContext => {
                 self.stack.pop().unwrap();
             }
 
@@ -2525,8 +2532,13 @@ impl<'a, B: Bindgen> Generator<'a, B> {
             | Type::U64
             | Type::S64
             | Type::F32
-            | Type::F64
-            | Type::ErrorContext => {}
+            | Type::F64 => {}
+
+            Type::ErrorContext if what.handles() => {
+                self.read_from_memory(ty, addr, offset);
+                self.emit(&DropHandle { ty });
+            }
+            Type::ErrorContext => {}
 
             Type::Id(id) => match &self.resolve.types[id].kind {
                 TypeDefKind::Type(t) => self.deallocate_indirect(t, addr, offset, what),

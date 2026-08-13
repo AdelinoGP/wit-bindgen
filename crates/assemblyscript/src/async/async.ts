@@ -344,12 +344,13 @@ export class AsyncSubtask {
 }
 
 // Tasks are unmanaged and recovered from the context-0 raw pointer via
-// changetype. A single global task would resume the wrong state machine under
-// reentrancy, so the current task always comes from the context slot.
+// changetype. The callback ABI carries no task identity beyond this slot, so
+// nested scheduler tasks in the same model task would be ambiguous.
 
 export class Scheduler {
   @inline(false)
   static start<T extends AsyncTask>(task: T): i32 {
+    if (contextGet() != 0) unreachable();
     const ptr = changetype<usize>(task);
     // Capture AS's concrete/virtual method thunk before retaining only a pointer.
     const resume = task.resume;

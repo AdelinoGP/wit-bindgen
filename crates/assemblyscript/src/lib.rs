@@ -655,7 +655,11 @@ impl<'a> InterfaceGenerator<'a> {
             Type::F64 => "f64".into(),
             Type::Char => "i32".into(),
             Type::String => "string".into(),
-            Type::ErrorContext => "i32".into(),
+            Type::ErrorContext => {
+                self.needs_async = true;
+                self.world_gen.needs_async = true;
+                "async_.ErrorContext".into()
+            }
             Type::Id(id) => self.type_id_ref(*id),
         }
     }
@@ -962,6 +966,7 @@ impl<'a> InterfaceGenerator<'a> {
         writeln!(self.src, "  handle: i32 = 0;").unwrap();
         writeln!(self.src, "  result: usize = 0;").unwrap();
         writeln!(self.src, "  private started: bool = false;").unwrap();
+        writeln!(self.src, "  private cancellationRequested: bool = false;").unwrap();
         writeln!(self.src, "  private paramsReleased: bool = false;").unwrap();
         writeln!(self.src, "  private finished: bool = false;").unwrap();
         for field in &fields {
@@ -1037,9 +1042,10 @@ impl<'a> InterfaceGenerator<'a> {
         writeln!(self.src, "  cancel(): i32 {{").unwrap();
         writeln!(
             self.src,
-            "    if (!this.started || this.finished || this.handle == 0) unreachable();"
+            "    if (!this.started || this.finished || this.cancellationRequested || this.handle == 0) unreachable();"
         )
         .unwrap();
+        writeln!(self.src, "    this.cancellationRequested = true;").unwrap();
         writeln!(
             self.src,
             "    const status = async_.subtaskCancel(this.handle);"
@@ -2137,6 +2143,11 @@ impl<'a> CoreInterfaceGenerator<'a> for InterfaceGenerator<'a> {
                     "const __{safe}_table: Map<i32, {cls}> = new Map<i32, {cls}>();"
                 )
                 .unwrap();
+                writeln!(
+                    self.src,
+                    "const __{safe}_handles: Map<{cls}, i32> = new Map<{cls}, i32>();"
+                )
+                .unwrap();
                 writeln!(self.src, "let __{safe}_next: i32 = 1;").unwrap();
                 writeln!(
                     self.src,
@@ -2145,7 +2156,7 @@ impl<'a> CoreInterfaceGenerator<'a> for InterfaceGenerator<'a> {
                 .unwrap();
                 writeln!(
                     self.src,
-                    "  const h = __{safe}_next++; __{safe}_table.set(h, inst); return h;"
+                    "  const h = __{safe}_next++; __{safe}_table.set(h, inst); __{safe}_handles.set(inst, h); return h;"
                 )
                 .unwrap();
                 writeln!(self.src, "}}").unwrap();
@@ -2154,7 +2165,18 @@ impl<'a> CoreInterfaceGenerator<'a> for InterfaceGenerator<'a> {
                 writeln!(self.src, "  const inst = __{safe}_table.get(h);").unwrap();
                 writeln!(
                     self.src,
-                    "  if (inst !== null) {{ inst.__onDrop(); __{safe}_table.delete(h); }}"
+                    "  if (inst !== null) {{ inst.__onDrop(); __{safe}_table.delete(h); __{safe}_handles.delete(inst); }}"
+                )
+                .unwrap();
+                writeln!(self.src, "}}").unwrap();
+                writeln!(
+                    self.src,
+                    "export function __{safe}_drop_instance(inst: {cls}): void {{"
+                )
+                .unwrap();
+                writeln!(
+                    self.src,
+                    "  const h = __{safe}_handles.get(inst); if (h !== null) __{safe}_drop(h);"
                 )
                 .unwrap();
                 writeln!(self.src, "}}").unwrap();
@@ -2903,16 +2925,19 @@ impl<'a, 'b> Bindgen for FunctionBindgen<'a, 'b> {
                 }
             }
 
-            // Futures / streams / error-context — opaque i32 pass-through.
-            Instruction::FutureLower { .. }
-            | Instruction::StreamLower { .. }
-            | Instruction::ErrorContextLower => {
+            // Futures and streams remain opaque handles. Error contexts are
+            // owned values, so keep the typed wrapper at the source level.
+            Instruction::FutureLower { .. } | Instruction::StreamLower { .. } => {
                 results.push(format!("(<i32>{})", operands[0]));
             }
-            Instruction::FutureLift { .. }
-            | Instruction::StreamLift { .. }
-            | Instruction::ErrorContextLift => {
+            Instruction::ErrorContextLower => {
+                results.push(format!("{}.handle", operands[0]));
+            }
+            Instruction::FutureLift { .. } | Instruction::StreamLift { .. } => {
                 results.push(format!("(<i32>{})", operands[0]));
+            }
+            Instruction::ErrorContextLift => {
+                results.push(format!("new async_.ErrorContext(<i32>{})", operands[0]));
             }
 
             // Flags
@@ -3421,6 +3446,50 @@ impl<'a, 'b> Bindgen for FunctionBindgen<'a, 'b> {
             }
 
             Instruction::DropHandle { ty } => {
+                if matches!(ty, Type::ErrorContext) {
+                    self.push_line(&format!("{}.drop();", operands[0]));
+                    return;
+                }
+                if let Type::Id(id) = ty {
+                    let id = wit_bindgen_core::dealias(self.iface_gen.resolve, *id);
+                    if matches!(
+                        &self.iface_gen.resolve.types[id].kind,
+                        TypeDefKind::Handle(Handle::Own(resource_id))
+                            if !self
+                                .iface_gen
+                                .world_gen
+                    .exported_resources
+                    .contains(&wit_bindgen_core::dealias(
+                                    self.iface_gen.resolve,
+                                    *resource_id,
+                                ))
+                    ) {
+                        let TypeDefKind::Handle(Handle::Own(resource_id)) =
+                            &self.iface_gen.resolve.types[id].kind
+                        else {
+                            unreachable!();
+                        };
+                        let resource_id =
+                            wit_bindgen_core::dealias(self.iface_gen.resolve, *resource_id);
+                        let cls = self.iface_gen.named_type_ref(resource_id);
+                        self.push_line(&format!("new {cls}({}).drop();", operands[0]));
+                        return;
+                    }
+                    if self.iface_gen.world_gen.exported_resources.contains(&id) {
+                        let prefix = resource_table_prefix(self.iface_gen, id);
+                        let safe = sanitize_extern_local(&ident::type_name(
+                            self.iface_gen.resolve.types[id]
+                                .name
+                                .as_deref()
+                                .unwrap_or_default(),
+                        ));
+                        self.push_line(&format!(
+                            "{prefix}__{safe}_drop_instance({});",
+                            operands[0]
+                        ));
+                        return;
+                    }
+                }
                 let Type::Id(id) = ty else {
                     let _ = operands;
                     return;
@@ -3703,5 +3772,159 @@ mod tests {
             .find("rawImportRunFuture2DropReadable((<i32>load<i32>(this.result + 0)))")
             .expect("result uses endpoint helper 2");
         assert!(param0 < param1 && param1 < result);
+    }
+
+    #[test]
+    fn async_import_cancel_is_exactly_once() {
+        let files = generate(
+            r#"
+                package test:bindings;
+
+                interface api {
+                    run: async func();
+                }
+
+                world test-world {
+                    import api;
+                }
+            "#,
+            "test-world",
+            Opts::default(),
+        );
+        let generated = files
+            .iter()
+            .filter_map(|(_, contents)| std::str::from_utf8(contents).ok())
+            .find(|contents| contents.contains("class RunSubtask"))
+            .expect("generated async import subtask");
+
+        assert!(generated.contains("private cancellationRequested: bool = false;"));
+        assert!(generated.contains(
+            "if (!this.started || this.finished || this.cancellationRequested || this.handle == 0) unreachable();"
+        ));
+        assert!(generated.contains("this.cancellationRequested = true;"));
+    }
+
+    #[test]
+    fn error_context_uses_typed_wrapper_and_drop() {
+        let files = generate(
+            r#"
+                package test:bindings;
+
+                interface api {
+                    round-trip: func(context: error-context) -> error-context;
+                }
+
+                world test-world {
+                    export api;
+                }
+            "#,
+            "test-world",
+            Opts::default(),
+        );
+        let generated = files
+            .iter()
+            .filter_map(|(_, contents)| std::str::from_utf8(contents).ok())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(generated.contains("async_.ErrorContext"));
+        assert!(generated.contains("new async_.ErrorContext"));
+        assert!(generated.contains(".handle"));
+    }
+
+    #[test]
+    fn stream_payload_helpers_keep_canonical_payload_pointer() {
+        let files = generate(
+            r#"
+                package test:bindings;
+
+                interface api {
+                    type bytes = stream<u8>;
+                    consume: func(value: bytes);
+                }
+
+                world test-world {
+                    export api;
+                }
+            "#,
+            "test-world",
+            Opts::default(),
+        );
+        let generated = files
+            .iter()
+            .filter_map(|(_, contents)| std::str::from_utf8(contents).ok())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(generated.contains("rawExportConsumeStream0Read"));
+        assert!(generated.contains("payload: usize"));
+    }
+
+    #[test]
+    fn async_import_cleanup_drops_imported_owned_resources() {
+        let files = generate(
+            r#"
+                package test:bindings;
+
+                interface api {
+                    resource item;
+                    run: async func(value: own<item>);
+                }
+
+                world test-world {
+                    import api;
+                }
+            "#,
+            "test-world",
+            Opts {
+                async_: AsyncFilterSet::all(true),
+                ..Opts::default()
+            },
+        );
+        let generated = files
+            .iter()
+            .filter_map(|(_, contents)| std::str::from_utf8(contents).ok())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(generated.contains("drop();"), "{generated}");
+    }
+
+    #[test]
+    fn exported_owned_resource_cleanup_uses_instance_table() {
+        let files = generate(
+            r#"
+                package test:bindings;
+
+                interface api {
+                    resource item;
+                    run: async func(value: own<item>);
+                }
+
+                world test-world {
+                    export api;
+                }
+            "#,
+            "test-world",
+            Opts {
+                async_: AsyncFilterSet::all(true),
+                ..Opts::default()
+            },
+        );
+        let generated = files
+            .iter()
+            .filter_map(|(_, contents)| std::str::from_utf8(contents).ok())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(generated.contains("Map<Item, i32>"));
+        assert!(generated.contains("Item_drop_instance"));
+    }
+
+    #[test]
+    fn scheduler_rejects_reentrant_tasks() {
+        assert!(r#async::ASYNC_TS.contains(
+            "if (contextGet() != 0) unreachable();\n    const ptr = changetype<usize>(task);"
+        ));
     }
 }
