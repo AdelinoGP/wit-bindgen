@@ -1566,10 +1566,7 @@ impl EndpointIntrinsic {
     }
 
     fn async_lowered(self) -> bool {
-        matches!(
-            self,
-            Self::Read | Self::Write | Self::CancelRead | Self::CancelWrite
-        )
+        matches!(self, Self::Read | Self::Write)
     }
 
     fn future(self) -> FutureIntrinsic {
@@ -3261,5 +3258,81 @@ fn bitcast_expr(cast: &Bitcast, op: &str) -> String {
             let inner = bitcast_expr(&seq[0], op);
             bitcast_expr(&seq[1], &inner)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wit_bindgen_core::wit_parser::{FunctionKind, Param, Stability, TypeDef};
+
+    fn future_type(resolve: &mut Resolve, payload: Option<Type>) -> TypeId {
+        resolve.types.alloc(TypeDef {
+            name: None,
+            kind: TypeDefKind::Future(payload),
+            owner: TypeOwner::None,
+            docs: Docs::default(),
+            stability: Stability::Unknown,
+            span: Default::default(),
+            external_id: None,
+        })
+    }
+
+    fn test_function(params: Vec<(&str, Type)>) -> Function {
+        Function {
+            name: "f".into(),
+            kind: FunctionKind::Freestanding,
+            params: params
+                .into_iter()
+                .map(|(name, ty)| Param {
+                    name: name.to_string(),
+                    ty,
+                    span: Default::default(),
+                })
+                .collect(),
+            result: None,
+            docs: Docs::default(),
+            stability: Stability::Unknown,
+            span: Default::default(),
+            external_id: None,
+        }
+    }
+
+    #[test]
+    fn only_read_write_are_async_lowered() {
+        assert!(EndpointIntrinsic::Read.async_lowered());
+        assert!(EndpointIntrinsic::Write.async_lowered());
+        assert!(!EndpointIntrinsic::New.async_lowered());
+        assert!(!EndpointIntrinsic::CancelRead.async_lowered());
+        assert!(!EndpointIntrinsic::CancelWrite.async_lowered());
+        assert!(!EndpointIntrinsic::DropReadable.async_lowered());
+        assert!(!EndpointIntrinsic::DropWritable.async_lowered());
+    }
+
+    #[test]
+    fn cancel_intrinsics_omit_async_lower_in_canonical_name() {
+        let mut resolve = Resolve::default();
+        let future = future_type(&mut resolve, Some(Type::U32));
+        let func = test_function(vec![("h", Type::Id(future))]);
+        let field = |intrinsic: FutureIntrinsic, async_: bool| {
+            resolve
+                .wasm_import_name(
+                    ManglingAndAbi::Legacy(LiftLowerAbi::Sync),
+                    WasmImport::FutureIntrinsic {
+                        interface: None,
+                        func: &func,
+                        ty: Some(future),
+                        intrinsic,
+                        exported: false,
+                        async_,
+                    },
+                )
+                .1
+        };
+
+        assert!(field(FutureIntrinsic::Read, true).contains("async-lower"));
+        assert!(field(FutureIntrinsic::Write, true).contains("async-lower"));
+        assert!(!field(FutureIntrinsic::CancelRead, false).contains("async-lower"));
+        assert!(!field(FutureIntrinsic::CancelWrite, false).contains("async-lower"));
     }
 }
