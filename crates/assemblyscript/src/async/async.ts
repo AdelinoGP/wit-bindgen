@@ -294,11 +294,15 @@ export function errorContextDebugMessage(handle: i32): string {
 // Implementations own their state and decide how each canonical event advances
 // it. Generated per-export task bases provide finish(), which records the
 // result for delivery after resume() has unwound. Return CALLBACK_CODE_YIELD to
-// yield, or callbackWait(set.handle) to wait.
+// yield, or callbackWait(set.handle) to wait. Task subclasses are unmanaged:
+// persist only scalar handles and pointers, not managed strings, arrays, or
+// class references. Lower managed values into owned buffers before yielding.
+@unmanaged
 export abstract class AsyncTask {
   abstract resume(event: i32, waitable: i32, code: i32): i32;
 }
 
+@unmanaged
 export class UnimplementedTask extends AsyncTask {
   resume(_event: i32, _waitable: i32, _code: i32): i32 {
     unreachable();
@@ -338,21 +342,14 @@ export class AsyncSubtask {
   }
 }
 
-// Tasks are pinned in Scheduler.start and recovered from the context-0 pointer
-// via changetype. Pinning keeps the task alive across wait/event boundaries
-// (the incremental collector can run while the task is suspended); the pin is
-// released only after task.return has delivered the result (see release()).
-// A single global task would resume the wrong state machine under reentrancy,
-// so the current task always comes from the context slot.
+// Tasks are unmanaged and recovered from the context-0 raw pointer via
+// changetype. A single global task would resume the wrong state machine under
+// reentrancy, so the current task always comes from the context slot.
 
 export class Scheduler {
   @inline(false)
   static start(task: AsyncTask): i32 {
     const ptr = changetype<usize>(task);
-    // Pin the task so the incremental collector cannot reclaim it while it is
-    // suspended across wait/event boundaries. The pin is released only after
-    // task.return has delivered the result (see release()).
-    __pin(ptr);
     contextSet(ptr);
     return task.resume(EVENT_NONE, 0, 0);
   }
@@ -372,16 +369,12 @@ export class Scheduler {
     return changetype<AsyncTask>(ptr);
   }
 
-  static release(): void {
-    // Unpin the task now that task.return has delivered its result. The
-    // incremental collector can run while task.return is delivering results,
-    // so the pin must stay in place until this point.
-    const ptr = contextGet();
-    if (ptr != 0) __unpin(ptr);
+  static release(ptr: usize): void {
+    if (ptr != 0) heap.free(ptr);
   }
 
-  static complete(): void {
-    contextSet(0);
+  static complete(ptr: usize): void {
+    if (contextGet() == ptr) contextSet(0);
   }
 
   static yield(): i32 {

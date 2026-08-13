@@ -967,14 +967,14 @@ impl<'a> InterfaceGenerator<'a> {
         let sig = self.func_signature(func, variant);
 
         if is_async {
-            self.emit_async_task_base(func, &func_local, &sig);
+            self.emit_async_task_base(func, &user_ident, &sig);
         }
 
         self.docs(&func.docs);
         if is_async {
             writeln!(
                 self.src,
-                "/// Return an explicit state machine; the host resumes it through `resume`."
+                "/// Return an `@unmanaged` state machine; persist only scalar handles/pointers across `resume` calls."
             )
             .unwrap();
         }
@@ -988,7 +988,7 @@ impl<'a> InterfaceGenerator<'a> {
             writeln!(
                 self.src,
                 "  return new {}Task();",
-                ident::type_name(&func_local)
+                ident::type_name(&user_ident)
             )
             .unwrap();
         } else {
@@ -1071,7 +1071,7 @@ impl<'a> InterfaceGenerator<'a> {
             writeln!(self.src, "}}").unwrap();
             writeln!(self.src).unwrap();
             wrapper_body = format!(
-                "const __status = {start_name}({});\nif (__finish_{unique_as_name}(__status)) {{ async_.Scheduler.release(); async_.Scheduler.complete(); }}\nreturn __status;",
+                "const __status = {start_name}({});\n__finish_{unique_as_name}(__status);\nreturn __status;",
                 (0..sig.wasm_params.len())
                     .map(|i| format!("a{i}"))
                     .collect::<Vec<_>>()
@@ -1102,7 +1102,7 @@ impl<'a> InterfaceGenerator<'a> {
         });
 
         if is_async {
-            self.emit_async_export_support(func, &func_local);
+            self.emit_async_export_support(func, &func_local, &user_ident);
         }
     }
 
@@ -1113,7 +1113,7 @@ impl<'a> InterfaceGenerator<'a> {
         let task_return_types = task_return_sig.params;
         writeln!(
             self.src,
-            "export class {task_type} extends async_.AsyncTask {{"
+            "@unmanaged\nexport class {task_type} extends async_.AsyncTask {{"
         )
         .unwrap();
         writeln!(
@@ -1189,14 +1189,14 @@ impl<'a> InterfaceGenerator<'a> {
         writeln!(self.src).unwrap();
     }
 
-    fn emit_async_export_support(&mut self, func: &Function, func_local: &str) {
+    fn emit_async_export_support(&mut self, func: &Function, func_local: &str, user_ident: &str) {
         let safe = sanitize_extern_local(&format!(
             "{}_{}",
             self.interface.map(|id| id.index()).unwrap_or(usize::MAX),
             func_local
         ));
         let task_return_extern = format!("__task_return_{safe}");
-        let task_type = format!("{}Task", ident::type_name(func_local));
+        let task_type = format!("{}Task", ident::type_name(user_ident));
         let finish_name = format!("__finish___exp_{safe}");
         let (module, task_return_name, task_return_sig) =
             func.task_return_import(self.resolve, self.interface_key.as_ref(), Mangling::Legacy);
@@ -1225,19 +1225,18 @@ impl<'a> InterfaceGenerator<'a> {
             .join(", ");
         writeln!(
             self.src,
-            "@inline(false)\nexport function {finish_name}(status: i32): bool {{"
+            "@inline(false)\nexport function {finish_name}(status: i32): void {{"
         )
         .unwrap();
         writeln!(self.src, "  const task = async_.contextGet();").unwrap();
         writeln!(
             self.src,
-            "  if (status == async_.CALLBACK_CODE_EXIT && task != 0 && load<bool>(task + offsetof<{task_type}>(\"finished\"))) {{"
+            "  if (status != async_.CALLBACK_CODE_EXIT || task == 0) return;"
         )
         .unwrap();
-        writeln!(self.src, "    {task_return_extern}({return_args});").unwrap();
-        writeln!(self.src, "    return true;").unwrap();
-        writeln!(self.src, "  }}").unwrap();
-        writeln!(self.src, "  return false;").unwrap();
+        writeln!(self.src, "  if (load<bool>(task + offsetof<{task_type}>(\"finished\"))) {task_return_extern}({return_args});").unwrap();
+        writeln!(self.src, "  async_.Scheduler.release(task);").unwrap();
+        writeln!(self.src, "  async_.Scheduler.complete(task);").unwrap();
         writeln!(self.src, "}}").unwrap();
         writeln!(self.src).unwrap();
 
@@ -1253,11 +1252,7 @@ impl<'a> InterfaceGenerator<'a> {
             "  const status = async_.Scheduler.resume(event, waitable, code);"
         )
         .unwrap();
-        writeln!(
-            self.src,
-            "  if ({finish_name}(status)) {{ async_.Scheduler.release(); async_.Scheduler.complete(); }}"
-        )
-        .unwrap();
+        writeln!(self.src, "  {finish_name}(status);").unwrap();
         writeln!(self.src, "  return status;").unwrap();
         writeln!(self.src, "}}").unwrap();
         writeln!(self.src).unwrap();
