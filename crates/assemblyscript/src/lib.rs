@@ -1125,6 +1125,7 @@ impl<'a> InterfaceGenerator<'a> {
         writeln!(self.src, "    return async_.CALLBACK_CODE_EXIT;").unwrap();
         writeln!(self.src, "  }}").unwrap();
         writeln!(self.src, "  finished: bool = false;").unwrap();
+        self.emit_typed_future_helpers(func);
         for (i, ty) in task_return_types.iter().enumerate() {
             writeln!(self.src, "  return{i}: {} = 0;", wasm_type_name(*ty)).unwrap();
         }
@@ -1187,6 +1188,146 @@ impl<'a> InterfaceGenerator<'a> {
         }
         writeln!(self.src, "}}").unwrap();
         writeln!(self.src).unwrap();
+    }
+
+    fn emit_typed_future_helpers(&mut self, func: &Function) {
+        for (index, ty) in func
+            .find_futures_and_streams(self.resolve)
+            .into_iter()
+            .enumerate()
+        {
+            let TypeDefKind::Future(payload) = &self.resolve.types[ty].kind else {
+                continue;
+            };
+            let payload = *payload;
+            let stem = format!(
+                "rawExport{}Future{index}",
+                ident::type_name(&Self::func_ident(&func.name))
+            );
+            let field = format!("future{index}Payload");
+
+            if let Some(payload) = payload {
+                let layout = self.world_gen.sizes.record([&payload]);
+                writeln!(self.src, "  private {field}: usize = 0;").unwrap();
+                writeln!(self.src, "  startFuture{index}Read(handle: i32): i32 {{").unwrap();
+                writeln!(
+                    self.src,
+                    "    if (this.{field} == 0) this.{field} = ffi.cabi_realloc(0, 0, {}, {});",
+                    layout.align.align_wasm32(),
+                    layout.size.size_wasm32()
+                )
+                .unwrap();
+                writeln!(self.src, "    return {stem}Read(handle, this.{field});").unwrap();
+                writeln!(self.src, "  }}").unwrap();
+
+                let result_ty = self.type_ref(&payload);
+                writeln!(self.src, "  finishFuture{index}Read(): {result_ty} {{").unwrap();
+                let mut bindgen = FunctionBindgen::new(
+                    self,
+                    func,
+                    AbiVariant::GuestExportAsync,
+                    LiftLower::LowerArgsLiftResults,
+                    String::new(),
+                );
+                let value = abi::lift_from_memory(
+                    bindgen.iface_gen.resolve,
+                    &mut bindgen,
+                    format!("this.{field}"),
+                    &payload,
+                );
+                bindgen.push_line(&format!("const value = {value};"));
+                abi::deallocate_lists_in_types(
+                    bindgen.iface_gen.resolve,
+                    &[payload],
+                    &[format!("this.{field}")],
+                    true,
+                    &mut bindgen,
+                );
+                for line in bindgen.into_body().lines() {
+                    writeln!(self.src, "    {line}").unwrap();
+                }
+                writeln!(self.src, "    const ptr = this.{field};").unwrap();
+                writeln!(self.src, "    this.{field} = 0;").unwrap();
+                writeln!(
+                    self.src,
+                    "    ffi.cabi_realloc(ptr, {}, {}, 0);",
+                    layout.size.size_wasm32(),
+                    layout.align.align_wasm32()
+                )
+                .unwrap();
+                writeln!(self.src, "    return value;").unwrap();
+                writeln!(self.src, "  }}").unwrap();
+
+                writeln!(
+                    self.src,
+                    "  startFuture{index}Write(handle: i32, value: {result_ty}): i32 {{"
+                )
+                .unwrap();
+                writeln!(
+                    self.src,
+                    "    if (this.{field} == 0) this.{field} = ffi.cabi_realloc(0, 0, {}, {});",
+                    layout.align.align_wasm32(),
+                    layout.size.size_wasm32()
+                )
+                .unwrap();
+                let mut bindgen = FunctionBindgen::new(
+                    self,
+                    func,
+                    AbiVariant::GuestExportAsync,
+                    LiftLower::LowerArgsLiftResults,
+                    String::new(),
+                );
+                abi::lower_to_memory(
+                    bindgen.iface_gen.resolve,
+                    &mut bindgen,
+                    format!("this.{field}"),
+                    "value".into(),
+                    &payload,
+                );
+                for line in bindgen.into_body().lines() {
+                    writeln!(self.src, "    {line}").unwrap();
+                }
+                writeln!(self.src, "    return {stem}Write(handle, this.{field});").unwrap();
+                writeln!(self.src, "  }}").unwrap();
+                writeln!(self.src, "  finishFuture{index}Write(): void {{").unwrap();
+                let mut bindgen = FunctionBindgen::new(
+                    self,
+                    func,
+                    AbiVariant::GuestExportAsync,
+                    LiftLower::LowerArgsLiftResults,
+                    String::new(),
+                );
+                abi::deallocate_lists_in_types(
+                    bindgen.iface_gen.resolve,
+                    &[payload],
+                    &[format!("this.{field}")],
+                    true,
+                    &mut bindgen,
+                );
+                for line in bindgen.into_body().lines() {
+                    writeln!(self.src, "    {line}").unwrap();
+                }
+                writeln!(self.src, "    const ptr = this.{field};").unwrap();
+                writeln!(self.src, "    this.{field} = 0;").unwrap();
+                writeln!(
+                    self.src,
+                    "    if (ptr != 0) ffi.cabi_realloc(ptr, {}, {}, 0);",
+                    layout.size.size_wasm32(),
+                    layout.align.align_wasm32()
+                )
+                .unwrap();
+                writeln!(self.src, "  }}").unwrap();
+            } else {
+                writeln!(self.src, "  startFuture{index}Read(handle: i32): i32 {{").unwrap();
+                writeln!(self.src, "    return {stem}Read(handle, 0);").unwrap();
+                writeln!(self.src, "  }}").unwrap();
+                writeln!(self.src, "  finishFuture{index}Read(): void {{}}").unwrap();
+                writeln!(self.src, "  startFuture{index}Write(handle: i32): i32 {{").unwrap();
+                writeln!(self.src, "    return {stem}Write(handle, 0);").unwrap();
+                writeln!(self.src, "  }}").unwrap();
+                writeln!(self.src, "  finishFuture{index}Write(): void {{}}").unwrap();
+            }
+        }
     }
 
     fn emit_async_export_support(&mut self, func: &Function, func_local: &str, user_ident: &str) {
