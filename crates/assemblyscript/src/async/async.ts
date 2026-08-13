@@ -299,6 +299,7 @@ export function errorContextDebugMessage(handle: i32): string {
 // class references. Lower managed values into owned buffers before yielding.
 @unmanaged
 export abstract class AsyncTask {
+  resumeIndex: u32 = 0;
   abstract resume(event: i32, waitable: i32, code: i32): i32;
 }
 
@@ -348,8 +349,11 @@ export class AsyncSubtask {
 
 export class Scheduler {
   @inline(false)
-  static start(task: AsyncTask): i32 {
+  static start<T extends AsyncTask>(task: T): i32 {
     const ptr = changetype<usize>(task);
+    // Capture AS's concrete/virtual method thunk before retaining only a pointer.
+    const resume = task.resume;
+    task.resumeIndex = resume.index;
     contextSet(ptr);
     return task.resume(EVENT_NONE, 0, 0);
   }
@@ -360,7 +364,8 @@ export class Scheduler {
     if (ptr == 0) return CALLBACK_CODE_EXIT;
     const task = changetype<AsyncTask>(ptr);
     if (event == EVENT_CANCEL) taskCancel();
-    return task.resume(event, waitable, code);
+    // Bound AS methods take `this` before their declared arguments.
+    return call_indirect<i32>(task.resumeIndex, ptr, event, waitable, code);
   }
 
   static current(): AsyncTask {
