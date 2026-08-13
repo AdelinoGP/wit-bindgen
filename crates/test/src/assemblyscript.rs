@@ -59,6 +59,10 @@ impl LanguageMethods for AssemblyScript {
         &[]
     }
 
+    fn codegen_test_variants(&self) -> &[(&str, &[&str])] {
+        &[("async", &["--async", "all"])]
+    }
+
     fn compile(&self, runner: &Runner, compile: &Compile<'_>) -> Result<()> {
         // Pull the user's test/runner file into the expected slot under the
         // generated `exports/` tree.

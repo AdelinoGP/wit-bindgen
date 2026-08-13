@@ -14,9 +14,10 @@
 //!
 //! # Async
 //!
-//! `future<T>`, `stream<T>`, and `error-context` lower to opaque `i32` handle
-//! aliases — sync code that just shuttles handles around works. Functions
-//! marked `async` in WIT emit a body of `unreachable()`.
+//! Async callback bindings use an explicit stackless `AsyncTask` API because
+//! AssemblyScript has no native async/await. `future<T>`, `stream<T>`, and
+//! `error-context` remain opaque handles; payload read/write operations are not
+//! generated yet.
 
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -24,19 +25,19 @@ use std::fmt::Write as _;
 use std::mem;
 use wit_bindgen_core::abi::{self, AbiVariant, Bindgen, Bitcast, Instruction, LiftLower, WasmType};
 use wit_bindgen_core::wit_parser::{
-    Alignment, ArchitectureSize, Docs, Enum, Flags, FlagsRepr, Function, FunctionKind, Handle,
-    InterfaceId, ManglingAndAbi, Record, Resolve, Result_, SizeAlign, Tuple, Type, TypeDefKind,
-    TypeId, TypeOwner, Variant, WorldId, WorldKey,
+    Alignment, ArchitectureSize, Docs, Enum, Flags, FlagsRepr, Function, Handle, InterfaceId,
+    LiftLowerAbi, Mangling, ManglingAndAbi, Record, Resolve, Result_, SizeAlign, Tuple, Type,
+    TypeDefKind, TypeId, TypeOwner, Variant, WasmExport, WasmExportKind, WorldId, WorldKey,
 };
 use wit_bindgen_core::{
     AsyncFilterSet, Direction, Files, InterfaceGenerator as CoreInterfaceGenerator, WorldGenerator,
 };
 
+mod r#async;
 mod ffi;
 mod ident;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-
 // =============================================================================
 // Opts
 // =============================================================================
@@ -72,8 +73,7 @@ pub struct Opts {
     #[cfg_attr(feature = "clap", arg(long, default_value_t = false))]
     pub ignore_stub: bool,
 
-    /// Async-function filter. Accepted, but `async` functions trap at runtime
-    /// (the AS backend does not yet implement the AsyncCallback ABI).
+    /// Select functions to bind with the canonical async callback ABI.
     #[cfg_attr(feature = "clap", clap(flatten))]
     pub async_: AsyncFilterSet,
 }
@@ -102,6 +102,7 @@ struct InterfaceFragment {
     /// line at the top of the emitted file.
     imports_imports: BTreeSet<String>,
     imports_exports: BTreeSet<String>,
+    needs_async: bool,
 }
 
 /// Stage where exported wasm functions land while we build the world.
@@ -158,6 +159,7 @@ pub struct AssemblyScript {
     /// Counters for unique handle counters per exported resource (one per
     /// exported resource type id).
     exported_resources: Vec<TypeId>,
+    needs_async: bool,
 }
 
 impl WorldGenerator for AssemblyScript {
@@ -273,6 +275,7 @@ impl WorldGenerator for AssemblyScript {
     }
 
     fn finish(&mut self, _resolve: &Resolve, _world: WorldId, files: &mut Files) -> Result<()> {
+        self.opts.async_.ensure_all_used()?;
         // Emit imports/<basename>.ts files.
         let import_interfaces = mem::take(&mut self.import_interfaces);
         for (basename, frag) in &import_interfaces {
@@ -307,6 +310,7 @@ impl WorldGenerator for AssemblyScript {
             combined
                 .imports_exports
                 .extend(self.world_exports.imports_exports.iter().cloned());
+            combined.needs_async = self.world_imports.needs_async || self.world_exports.needs_async;
             combined.src.push_str(&self.world_imports.src);
             combined.src.push('\n');
             combined.src.push_str(&self.world_exports.src);
@@ -326,6 +330,10 @@ impl WorldGenerator for AssemblyScript {
         // ffi.ts: helpers + __IMPORT_RETURN_AREA sized to this world.
         let ffi_ts = self.render_ffi_ts();
         files.push("ffi.ts", ffi_ts.as_bytes());
+
+        if self.needs_async {
+            files.push("async.ts", r#async::ASYNC_TS.as_bytes());
+        }
 
         // asconfig.json: target config consumed by `asc --target release`.
         if !self.opts.ignore_stub {
@@ -406,20 +414,10 @@ impl AssemblyScript {
         writeln!(s, "// export section to match the canonical WIT names (see").unwrap();
         writeln!(s, "// wit_bindgen_exports.json for the rename map).").unwrap();
         writeln!(s, "//").unwrap();
-        writeln!(
-            s,
-            "// ASYNC LIMITATIONS: future<T>/stream<T>/error-context types are"
-        )
-        .unwrap();
-        writeln!(
-            s,
-            "// emitted as opaque i32 handle aliases. Functions marked `async` in"
-        )
-        .unwrap();
-        writeln!(s, "// WIT trap at runtime (unreachable).").unwrap();
-        writeln!(s).unwrap();
-
         writeln!(s, "import * as ffi from \"./ffi\";").unwrap();
+        if self.needs_async {
+            writeln!(s, "import * as async_ from \"./async\";").unwrap();
+        }
         // Re-export cabi_realloc so the host can allocate guest memory.
         writeln!(s, "export {{ cabi_realloc }} from \"./ffi\";").unwrap();
         writeln!(s).unwrap();
@@ -535,6 +533,9 @@ fn render_interface_file(frag: &InterfaceFragment, kind: &str) -> String {
     writeln!(s, "// Generated by wit-bindgen {VERSION}. DO NOT EDIT.").unwrap();
     writeln!(s).unwrap();
     writeln!(s, "import * as ffi from \"{prefix}ffi\";").unwrap();
+    if frag.needs_async {
+        writeln!(s, "import * as async_ from \"{prefix}async\";").unwrap();
+    }
     for basename in &frag.imports_imports {
         writeln!(
             s,
@@ -559,6 +560,7 @@ impl InterfaceFragment {
         self.src.push_str(&other.src);
         self.imports_imports.extend(other.imports_imports);
         self.imports_exports.extend(other.imports_exports);
+        self.needs_async |= other.needs_async;
     }
 }
 
@@ -578,6 +580,7 @@ struct InterfaceGenerator<'a> {
     src: String,
     imports_imports: BTreeSet<String>,
     imports_exports: BTreeSet<String>,
+    needs_async: bool,
 }
 
 impl<'a> InterfaceGenerator<'a> {
@@ -597,6 +600,7 @@ impl<'a> InterfaceGenerator<'a> {
             src: String::new(),
             imports_imports: BTreeSet::new(),
             imports_exports: BTreeSet::new(),
+            needs_async: false,
         }
     }
 
@@ -620,6 +624,7 @@ impl<'a> InterfaceGenerator<'a> {
             src: self.src,
             imports_imports: self.imports_imports,
             imports_exports: self.imports_exports,
+            needs_async: self.needs_async,
         }
     }
 
@@ -773,18 +778,31 @@ impl<'a> InterfaceGenerator<'a> {
         } else {
             func_local.clone()
         };
-        let raw_extern_name = func.name.clone();
+        let is_async = self.world_gen.opts.async_.is_async(
+            self.resolve,
+            self.interface_key.as_ref(),
+            func,
+            true,
+        );
+        if is_async {
+            self.needs_async = true;
+            self.world_gen.needs_async = true;
+        }
+        let raw_extern_name = if is_async {
+            format!("[async-lower]{}", func.name)
+        } else {
+            func.name.clone()
+        };
         let wasm_module = self.wasm_import_module(func);
         let mangled_extern = format!("__ext_{}", sanitize_extern_local(&func_local));
 
         // Signature: emit @external `declare` + a friendly wrapper.
-        let sig = self.func_signature(func, AbiVariant::GuestImport);
-        let is_async = matches!(
-            func.kind,
-            FunctionKind::AsyncFreestanding
-                | FunctionKind::AsyncMethod(_)
-                | FunctionKind::AsyncStatic(_)
-        );
+        let variant = if is_async {
+            AbiVariant::GuestImportAsync
+        } else {
+            AbiVariant::GuestImport
+        };
+        let sig = self.func_signature(func, variant);
 
         self.docs(&func.docs);
         writeln!(
@@ -792,7 +810,7 @@ impl<'a> InterfaceGenerator<'a> {
             "@external(\"{wasm_module}\", \"{raw_extern_name}\")"
         )
         .unwrap();
-        let wasm_sig = self.resolve.wasm_signature(AbiVariant::GuestImport, func);
+        let wasm_sig = self.resolve.wasm_signature(variant, func);
         let params_ext: Vec<String> = wasm_sig
             .params
             .iter()
@@ -819,12 +837,81 @@ impl<'a> InterfaceGenerator<'a> {
 
         // Friendly wrapper: lifts args from AS values into wasm types, calls
         // the import, lifts results back.
-        let wrapper = sig.wrapper_signature(&wrapper_name);
+        let wrapper = if is_async {
+            sig.async_import_signature(&wrapper_name)
+        } else {
+            sig.wrapper_signature(&wrapper_name)
+        };
         writeln!(self.src, "export function {wrapper} {{").unwrap();
         if is_async {
-            writeln!(self.src, "  unreachable();").unwrap();
-            if let Some(ret_ty) = &sig.return_type {
-                writeln!(self.src, "  return {};", default_value_for(ret_ty)).unwrap();
+            let mut bindgen = FunctionBindgen::new(
+                self,
+                func,
+                variant,
+                LiftLower::LowerArgsLiftResults,
+                mangled_extern.clone(),
+            );
+            let mut wasm_params = Vec::new();
+            if wasm_sig.indirect_params {
+                let layout = bindgen
+                    .iface_gen
+                    .world_gen
+                    .sizes
+                    .record(func.params.iter().map(|p| &p.ty));
+                let ptr = "__params";
+                bindgen.push_line(&format!(
+                    "const {ptr} = ffi.cabi_realloc(0, 0, {}, {});",
+                    layout.align.align_wasm32(),
+                    layout.size.size_wasm32()
+                ));
+                for ((offset, ty), param) in bindgen
+                    .iface_gen
+                    .world_gen
+                    .sizes
+                    .field_offsets(func.params.iter().map(|p| &p.ty))
+                    .into_iter()
+                    .zip(func.params.iter())
+                {
+                    abi::lower_to_memory(
+                        bindgen.iface_gen.resolve,
+                        &mut bindgen,
+                        format!("{ptr} + {}", offset.size_wasm32()),
+                        ident::value_name(&param.name),
+                        ty,
+                    );
+                }
+                wasm_params.push(ptr.to_string());
+            } else {
+                for param in &func.params {
+                    wasm_params.extend(abi::lower_flat(
+                        bindgen.iface_gen.resolve,
+                        &mut bindgen,
+                        ident::value_name(&param.name),
+                        &param.ty,
+                    ));
+                }
+            }
+            let result_ptr = if let Some(result) = &func.result {
+                let layout = bindgen.iface_gen.world_gen.sizes.record([result]);
+                bindgen.push_line(&format!(
+                    "const __result = ffi.cabi_realloc(0, 0, {}, {});",
+                    layout.align.align_wasm32(),
+                    layout.size.size_wasm32()
+                ));
+                wasm_params.push("__result".into());
+                "__result"
+            } else {
+                "0"
+            };
+            bindgen.push_line(&format!(
+                "const __status = {mangled_extern}({});",
+                wasm_params.join(", ")
+            ));
+            bindgen.push_line(&format!(
+                "return new async_.AsyncSubtask(__status, <usize>{result_ptr});"
+            ));
+            for line in bindgen.into_body().lines() {
+                writeln!(self.src, "  {line}").unwrap();
             }
             writeln!(self.src, "}}").unwrap();
             writeln!(self.src).unwrap();
@@ -860,29 +947,39 @@ impl<'a> InterfaceGenerator<'a> {
         let user_ident = ident::value_name(user_ident);
 
         // 1. Stub in exports/<iface>.ts: the user-edited entrypoint.
-        let sig = self.func_signature(func, AbiVariant::GuestExport);
-        let is_async = matches!(
-            func.kind,
-            FunctionKind::AsyncFreestanding
-                | FunctionKind::AsyncMethod(_)
-                | FunctionKind::AsyncStatic(_)
+        let is_async = self.world_gen.opts.async_.is_async(
+            self.resolve,
+            self.interface_key.as_ref(),
+            func,
+            false,
         );
+        if is_async {
+            self.needs_async = true;
+            self.world_gen.needs_async = true;
+        }
+        let variant = if is_async {
+            AbiVariant::GuestExportAsync
+        } else {
+            AbiVariant::GuestExport
+        };
+        let sig = self.func_signature(func, variant);
 
         self.docs(&func.docs);
         if is_async {
             writeln!(
                 self.src,
-                "/// async stub — AS backend does not implement the AsyncCallback ABI."
+                "/// Return an explicit state machine; the host resumes it through `resume`."
             )
             .unwrap();
         }
-        let user_sig = sig.user_signature(&user_ident);
+        let user_sig = if is_async {
+            sig.async_export_signature(&user_ident)
+        } else {
+            sig.user_signature(&user_ident)
+        };
         writeln!(self.src, "export function {user_sig} {{").unwrap();
         if is_async {
-            writeln!(self.src, "  unreachable();").unwrap();
-            if let Some(ret_ty) = &sig.return_type {
-                writeln!(self.src, "  return {};", default_value_for(ret_ty)).unwrap();
-            }
+            writeln!(self.src, "  return new async_.UnimplementedTask();").unwrap();
         } else {
             writeln!(self.src, "  // TODO: implement").unwrap();
             if let Some(ret_ty) = &sig.return_type {
@@ -897,7 +994,7 @@ impl<'a> InterfaceGenerator<'a> {
         //    and any types defined in this file. bindings.ts plain-re-exports
         //    it by identifier; the post-compile rewriter renames the wasm
         //    export entry to the canonical WIT name.
-        let wasm_name = self.wasm_export_name(func);
+        let wasm_name = self.wasm_export_name(func, is_async, WasmExportKind::Normal);
         let unique_as_name = format!(
             "__exp_{}",
             sanitize_extern_local(&format!(
@@ -911,10 +1008,22 @@ impl<'a> InterfaceGenerator<'a> {
         let mut wrapper_body = String::new();
 
         if is_async {
-            writeln!(wrapper_body, "unreachable();").unwrap();
-            if let Some(rt) = sig.wasm_return_type() {
-                writeln!(wrapper_body, "return changetype<{rt}>(0);").unwrap();
-            }
+            let mut bindgen = FunctionBindgen::new(
+                self,
+                func,
+                variant,
+                LiftLower::LiftArgsLowerResults,
+                user_ident.clone(),
+            );
+            abi::call(
+                bindgen.iface_gen.resolve,
+                variant,
+                LiftLower::LiftArgsLowerResults,
+                func,
+                &mut bindgen,
+                true,
+            );
+            wrapper_body.push_str(&bindgen.into_body());
         } else {
             let user_call = user_ident.clone();
             let mut bindgen = FunctionBindgen::new(
@@ -956,6 +1065,112 @@ impl<'a> InterfaceGenerator<'a> {
             basename,
             body: String::new(),
         });
+
+        if is_async {
+            self.emit_async_export_support(func, &func_local);
+        }
+    }
+
+    fn emit_async_export_support(&mut self, func: &Function, func_local: &str) {
+        let safe = sanitize_extern_local(&format!(
+            "{}_{}",
+            self.interface.map(|id| id.index()).unwrap_or(usize::MAX),
+            func_local
+        ));
+        let task_return_extern = format!("__task_return_{safe}");
+        let task_return_helper = format!("taskReturn{}", ident::type_name(func_local));
+        let (module, task_return_name, task_return_sig) =
+            func.task_return_import(self.resolve, self.interface_key.as_ref(), Mangling::Legacy);
+        let task_return_types = task_return_sig.params;
+        let raw_params = task_return_types
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| format!("a{i}: {}", wasm_type_name(*ty)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(self.src, "@external(\"{module}\", \"{task_return_name}\")").unwrap();
+        writeln!(
+            self.src,
+            "declare function {task_return_extern}({raw_params}): void;"
+        )
+        .unwrap();
+
+        if let Some(result) = &func.result {
+            let result_ty = self.type_ref(result);
+            writeln!(
+                self.src,
+                "export function {task_return_helper}(result: {result_ty}): void {{"
+            )
+            .unwrap();
+            let mut bindgen = FunctionBindgen::new(
+                self,
+                func,
+                AbiVariant::GuestExportAsync,
+                LiftLower::LowerArgsLiftResults,
+                task_return_extern.clone(),
+            );
+            let args = if task_return_types == [WasmType::Pointer] {
+                let layout = bindgen.iface_gen.world_gen.sizes.record([result]);
+                bindgen.push_line(&format!(
+                    "const __result = ffi.cabi_realloc(0, 0, {}, {});",
+                    layout.align.align_wasm32(),
+                    layout.size.size_wasm32()
+                ));
+                abi::lower_to_memory(
+                    bindgen.iface_gen.resolve,
+                    &mut bindgen,
+                    "__result".into(),
+                    "result".into(),
+                    result,
+                );
+                vec!["__result".into()]
+            } else {
+                abi::lower_flat(
+                    bindgen.iface_gen.resolve,
+                    &mut bindgen,
+                    "result".into(),
+                    result,
+                )
+            };
+            bindgen.push_line(&format!("{task_return_extern}({});", args.join(", ")));
+            bindgen.push_line("async_.Scheduler.complete();");
+            for line in bindgen.into_body().lines() {
+                writeln!(self.src, "  {line}").unwrap();
+            }
+            writeln!(self.src, "}}").unwrap();
+        } else {
+            writeln!(
+                self.src,
+                "export function {task_return_helper}(): void {{ {task_return_extern}(); async_.Scheduler.complete(); }}"
+            )
+            .unwrap();
+        }
+        writeln!(self.src).unwrap();
+
+        let callback_name = self.wasm_export_name(func, true, WasmExportKind::Callback);
+        let callback_as_name = format!("__callback_{safe}");
+        writeln!(
+            self.src,
+            "export function {callback_as_name}(event: i32, waitable: i32, code: i32): i32 {{"
+        )
+        .unwrap();
+        writeln!(
+            self.src,
+            "  return async_.Scheduler.resume(event, waitable, code);"
+        )
+        .unwrap();
+        writeln!(self.src, "}}").unwrap();
+        writeln!(self.src).unwrap();
+        let basename = self
+            .interface
+            .and_then(|id| self.world_gen.export_basenames.get(&id).cloned())
+            .unwrap_or_default();
+        self.world_gen.exports.push(ExportEntry {
+            wasm_name: callback_name,
+            as_name: callback_as_name,
+            basename,
+            body: String::new(),
+        });
     }
 
     fn wasm_import_module(&self, _func: &Function) -> String {
@@ -965,13 +1180,17 @@ impl<'a> InterfaceGenerator<'a> {
         }
     }
 
-    fn wasm_export_name(&self, func: &Function) -> String {
+    fn wasm_export_name(&self, func: &Function, is_async: bool, kind: WasmExportKind) -> String {
         self.resolve.wasm_export_name(
-            ManglingAndAbi::Legacy(wit_bindgen_core::wit_parser::LiftLowerAbi::Sync),
-            wit_bindgen_core::wit_parser::WasmExport::Func {
+            ManglingAndAbi::Legacy(if is_async {
+                LiftLowerAbi::AsyncCallback
+            } else {
+                LiftLowerAbi::Sync
+            }),
+            WasmExport::Func {
                 interface: self.interface_key.as_ref(),
                 func,
-                kind: wit_bindgen_core::wit_parser::WasmExportKind::Normal,
+                kind,
             },
         )
     }
@@ -1013,6 +1232,26 @@ impl FuncSig {
 
     fn wrapper_signature(&self, name: &str) -> String {
         self.user_signature(name)
+    }
+
+    fn async_import_signature(&self, name: &str) -> String {
+        let ps = self
+            .params
+            .iter()
+            .map(|(n, t)| format!("{n}: {t}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{name}({ps}): async_.AsyncSubtask")
+    }
+
+    fn async_export_signature(&self, name: &str) -> String {
+        let ps = self
+            .params
+            .iter()
+            .map(|(n, t)| format!("{n}: {t}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{name}({ps}): async_.AsyncTask")
     }
 
     fn wasm_wrapper_signature(&self, name: &str) -> String {
@@ -2426,8 +2665,17 @@ impl<'a, 'b> Bindgen for FunctionBindgen<'a, 'b> {
             }
 
             Instruction::CallInterface { func, async_ } => {
-                let _ = async_;
                 let args = operands.drain(..).collect::<Vec<_>>().join(", ");
+                if *async_ {
+                    let task = self.fresh();
+                    self.push_line(&format!("const {task} = {}({args});", self.call_target));
+                    self.push_line(&format!("return async_.Scheduler.start({task});"));
+                    if let Some(result) = &func.result {
+                        let ty = self.iface_gen.type_ref(result);
+                        results.push(default_value_for(&ty));
+                    }
+                    return;
+                }
                 if func.result.is_some() {
                     let r = self.fresh();
                     self.push_line(&format!("const {r} = {}({args});", self.call_target));
@@ -2496,9 +2744,9 @@ impl<'a, 'b> Bindgen for FunctionBindgen<'a, 'b> {
                 let _ = operands;
             }
 
-            Instruction::AsyncTaskReturn { .. } => {
-                self.push_line("unreachable(); // async task.return not implemented");
-            }
+            // Explicit AsyncTask implementations call the generated taskReturn
+            // helper themselves when their state machine reaches completion.
+            Instruction::AsyncTaskReturn { .. } => {}
 
             Instruction::Flush { amt } => {
                 for op in operands.drain(..*amt) {
