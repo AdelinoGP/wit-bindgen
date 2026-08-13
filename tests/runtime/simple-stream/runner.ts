@@ -25,9 +25,9 @@ export function run(): void {
 
   assert(i_my$test$i.rawImportReadStreamStream0Write(write, 0, 1) == -1);
 
-  const status = i_my$test$i.readStream(read);
-  assert(async_.subtaskState(status) == async_.STATUS_STARTED);
-  const task = async_.subtaskHandle(status);
+  const subtask = i_my$test$i.readStream(read);
+  assert(subtask.state == async_.STATUS_STARTED);
+  const task = subtask.handle;
   assert(task != 0);
 
   const set = async_.waitableSetNew();
@@ -59,9 +59,9 @@ export function run(): void {
   event = async_.waitableSetWait(set, payload);
   assert(event == async_.EVENT_SUBTASK);
   assert(load<i32>(payload) == task);
-  assert(async_.subtaskState(load<i32>(payload + 4)) == async_.STATUS_RETURNED);
-  async_.waitableJoin(task, 0);
-  async_.subtaskDrop(task);
+  const status = load<i32>(payload + 4);
+  assert(async_.subtaskState(status) == async_.STATUS_RETURNED);
+  subtask.finish(status);
   async_.waitableSetDrop(set);
 }
 

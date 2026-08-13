@@ -37,8 +37,9 @@ export function run(): void {
     const read = reader(pair);
     const write = writer(pair);
     assert(i_my$test$i.rawImportReadFutureFuture0Write(write, 0) == -1);
-    const status = i_my$test$i.readFuture(read);
-    assert(async_.subtaskState(status) == async_.STATUS_RETURNED);
+    const subtask = i_my$test$i.readFuture(read);
+    assert(subtask.state == async_.STATUS_RETURNED);
+    subtask.finish(subtask.status);
     waitForWrite(write, async_.WAITABLE_COMPLETED);
     i_my$test$i.rawImportReadFutureFuture0DropWritable(write);
   }
@@ -48,8 +49,9 @@ export function run(): void {
     const read = reader(pair);
     const write = writer(pair);
     assert(i_my$test$i.rawImportDropFutureFuture0Write(write, 0) == -1);
-    const status = i_my$test$i.dropFuture(read);
-    assert(async_.subtaskState(status) == async_.STATUS_RETURNED);
+    const subtask = i_my$test$i.dropFuture(read);
+    assert(subtask.state == async_.STATUS_RETURNED);
+    subtask.finish(subtask.status);
     waitForWrite(write, async_.WAITABLE_DROPPED);
     i_my$test$i.rawImportDropFutureFuture0DropWritable(write);
   }

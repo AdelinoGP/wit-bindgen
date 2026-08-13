@@ -842,10 +842,14 @@ impl<'a> InterfaceGenerator<'a> {
         .unwrap();
         writeln!(self.src).unwrap();
 
+        if is_async {
+            self.emit_async_import_subtask(func, &func_local, &mangled_extern, &wasm_sig);
+        }
+
         // Friendly wrapper: lifts args from AS values into wasm types, calls
         // the import, lifts results back.
         let wrapper = if is_async {
-            sig.async_import_signature(&wrapper_name)
+            sig.async_import_signature(&wrapper_name, &func_local)
         } else {
             sig.wrapper_signature(&wrapper_name)
         };
@@ -898,19 +902,13 @@ impl<'a> InterfaceGenerator<'a> {
                     ));
                 }
             }
-            if let Some(result) = &func.result {
-                let layout = bindgen.iface_gen.world_gen.sizes.record([result]);
-                bindgen.push_line(&format!(
-                    "const __result = ffi.cabi_realloc(0, 0, {}, {});",
-                    layout.align.align_wasm32(),
-                    layout.size.size_wasm32()
-                ));
-                wasm_params.push("__result".into());
-            }
+            let subtask_type = format!("{}Subtask", ident::type_name(&func_local));
             bindgen.push_line(&format!(
-                "return {mangled_extern}({});",
+                "const subtask = new {subtask_type}({});",
                 wasm_params.join(", ")
             ));
+            bindgen.push_line("subtask.start();");
+            bindgen.push_line("return subtask;");
             for line in bindgen.into_body().lines() {
                 writeln!(self.src, "  {line}").unwrap();
             }
@@ -938,6 +936,267 @@ impl<'a> InterfaceGenerator<'a> {
         for line in body.lines() {
             writeln!(self.src, "  {line}").unwrap();
         }
+        writeln!(self.src, "}}").unwrap();
+        writeln!(self.src).unwrap();
+    }
+
+    fn emit_async_import_subtask(
+        &mut self,
+        func: &Function,
+        func_local: &str,
+        mangled_extern: &str,
+        wasm_sig: &wit_bindgen_core::abi::WasmSignature,
+    ) {
+        let subtask_type = format!("{}Subtask", ident::type_name(func_local));
+        let result_count = usize::from(func.result.is_some());
+        let param_types = &wasm_sig.params[..wasm_sig.params.len() - result_count];
+        let fields = param_types
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| format!("a{i}: {}", wasm_type_name(*ty)))
+            .collect::<Vec<_>>();
+
+        writeln!(self.src, "@unmanaged\nexport class {subtask_type} {{").unwrap();
+        writeln!(self.src, "  status: i32 = async_.STATUS_STARTING;").unwrap();
+        writeln!(self.src, "  state: i32 = async_.STATUS_STARTING;").unwrap();
+        writeln!(self.src, "  handle: i32 = 0;").unwrap();
+        writeln!(self.src, "  result: usize = 0;").unwrap();
+        writeln!(self.src, "  private started: bool = false;").unwrap();
+        writeln!(self.src, "  private paramsReleased: bool = false;").unwrap();
+        writeln!(self.src, "  private finished: bool = false;").unwrap();
+        for field in &fields {
+            writeln!(self.src, "  {field};").unwrap();
+        }
+        if !fields.is_empty() {
+            writeln!(self.src, "  constructor({}) {{", fields.join(", ")).unwrap();
+            for i in 0..fields.len() {
+                writeln!(self.src, "    this.a{i} = a{i};").unwrap();
+            }
+            writeln!(self.src, "  }}").unwrap();
+        }
+
+        writeln!(self.src, "  start(): i32 {{").unwrap();
+        writeln!(self.src, "    if (this.started) unreachable();").unwrap();
+        writeln!(self.src, "    this.started = true;").unwrap();
+        if let Some(result) = &func.result {
+            let layout = self.world_gen.sizes.record([result]);
+            writeln!(
+                self.src,
+                "    this.result = ffi.cabi_realloc(0, 0, {}, {});",
+                layout.align.align_wasm32(),
+                layout.size.size_wasm32()
+            )
+            .unwrap();
+        }
+        let mut args = (0..fields.len())
+            .map(|i| format!("this.a{i}"))
+            .collect::<Vec<_>>();
+        if func.result.is_some() {
+            args.push("this.result".into());
+        }
+        writeln!(
+            self.src,
+            "    this.update({mangled_extern}({}));",
+            args.join(", ")
+        )
+        .unwrap();
+        writeln!(self.src, "    return this.status;").unwrap();
+        writeln!(self.src, "  }}").unwrap();
+        writeln!(self.src, "  update(status: i32): void {{").unwrap();
+        writeln!(self.src, "    if (!this.started) unreachable();").unwrap();
+        writeln!(self.src, "    if (this.finished) unreachable();").unwrap();
+        writeln!(self.src, "    this.status = status;").unwrap();
+        writeln!(self.src, "    this.state = async_.subtaskState(status);").unwrap();
+        writeln!(self.src, "    const handle = async_.subtaskHandle(status);").unwrap();
+        writeln!(self.src, "    if (handle != 0) this.handle = handle;").unwrap();
+        writeln!(
+            self.src,
+            "    if (this.state == async_.STATUS_STARTED_CANCELLED) {{"
+        )
+        .unwrap();
+        writeln!(self.src, "      this.releaseParams(true);").unwrap();
+        writeln!(
+            self.src,
+            "    }} else if (this.state == async_.STATUS_STARTED ||"
+        )
+        .unwrap();
+        writeln!(
+            self.src,
+            "               this.state == async_.STATUS_RETURNED ||"
+        )
+        .unwrap();
+        writeln!(
+            self.src,
+            "               this.state == async_.STATUS_RETURNED_CANCELLED) {{"
+        )
+        .unwrap();
+        writeln!(self.src, "      this.releaseParams(false);").unwrap();
+        writeln!(self.src, "    }}").unwrap();
+        writeln!(self.src, "  }}").unwrap();
+
+        writeln!(self.src, "  private releaseParams(own: bool): void {{").unwrap();
+        writeln!(self.src, "    if (this.paramsReleased) return;").unwrap();
+        writeln!(self.src, "    this.paramsReleased = true;").unwrap();
+        let param_operands = (0..fields.len())
+            .map(|i| format!("this.a{i}"))
+            .collect::<Vec<_>>();
+        let param_types = func.params.iter().map(|p| p.ty).collect::<Vec<_>>();
+        writeln!(self.src, "    if (own) {{").unwrap();
+        let mut bindgen = FunctionBindgen::new(
+            self,
+            func,
+            AbiVariant::GuestImportAsync,
+            LiftLower::LowerArgsLiftResults,
+            String::new(),
+        );
+        abi::deallocate_lists_and_own_in_types(
+            bindgen.iface_gen.resolve,
+            &param_types,
+            &param_operands,
+            wasm_sig.indirect_params,
+            &mut bindgen,
+        );
+        for line in bindgen.into_body().lines() {
+            writeln!(self.src, "      {line}").unwrap();
+        }
+        writeln!(self.src, "    }} else {{").unwrap();
+        let mut bindgen = FunctionBindgen::new(
+            self,
+            func,
+            AbiVariant::GuestImportAsync,
+            LiftLower::LowerArgsLiftResults,
+            String::new(),
+        );
+        abi::deallocate_lists_in_types(
+            bindgen.iface_gen.resolve,
+            &param_types,
+            &param_operands,
+            wasm_sig.indirect_params,
+            &mut bindgen,
+        );
+        for line in bindgen.into_body().lines() {
+            writeln!(self.src, "      {line}").unwrap();
+        }
+        writeln!(self.src, "    }}").unwrap();
+        writeln!(self.src, "  }}").unwrap();
+
+        let return_type = func
+            .result
+            .as_ref()
+            .map(|ty| self.type_ref(ty))
+            .unwrap_or_else(|| "void".into());
+        writeln!(self.src, "  finish(status: i32): {return_type} {{").unwrap();
+        writeln!(self.src, "    if (this.finished) unreachable();").unwrap();
+        writeln!(self.src, "    this.update(status);").unwrap();
+        writeln!(
+            self.src,
+            "    if (this.state != async_.STATUS_RETURNED) unreachable();"
+        )
+        .unwrap();
+
+        let mut bindgen = FunctionBindgen::new(
+            self,
+            func,
+            AbiVariant::GuestImportAsync,
+            LiftLower::LowerArgsLiftResults,
+            String::new(),
+        );
+        if let Some(result) = &func.result {
+            let value = abi::lift_from_memory(
+                bindgen.iface_gen.resolve,
+                &mut bindgen,
+                "this.result".into(),
+                result,
+            );
+            bindgen.push_line(&format!("const value = {value};"));
+        }
+        bindgen.push_line("this.cleanup(false);");
+        if func.result.is_some() {
+            bindgen.push_line("return value;");
+        }
+        for line in bindgen.into_body().lines() {
+            writeln!(self.src, "    {line}").unwrap();
+        }
+        writeln!(self.src, "  }}").unwrap();
+
+        writeln!(self.src, "  dispose(status: i32): bool {{").unwrap();
+        writeln!(self.src, "    if (this.finished) unreachable();").unwrap();
+        writeln!(self.src, "    this.update(status);").unwrap();
+        writeln!(
+            self.src,
+            "    const cancelled = this.state == async_.STATUS_STARTED_CANCELLED ||"
+        )
+        .unwrap();
+        writeln!(
+            self.src,
+            "                      this.state == async_.STATUS_RETURNED_CANCELLED;"
+        )
+        .unwrap();
+        writeln!(
+            self.src,
+            "    if (!cancelled && this.state != async_.STATUS_RETURNED) unreachable();"
+        )
+        .unwrap();
+        writeln!(
+            self.src,
+            "    this.cleanup(this.state == async_.STATUS_RETURNED);"
+        )
+        .unwrap();
+        writeln!(self.src, "    return cancelled;").unwrap();
+        writeln!(self.src, "  }}").unwrap();
+
+        writeln!(self.src, "  private cleanup(disposeResult: bool): void {{").unwrap();
+        writeln!(self.src, "    if (this.finished) unreachable();").unwrap();
+        writeln!(self.src, "    this.finished = true;").unwrap();
+        if let Some(result) = &func.result {
+            writeln!(self.src, "    if (disposeResult) {{").unwrap();
+            let mut bindgen = FunctionBindgen::new(
+                self,
+                func,
+                AbiVariant::GuestImportAsync,
+                LiftLower::LowerArgsLiftResults,
+                String::new(),
+            );
+            abi::deallocate_lists_and_own_in_types(
+                bindgen.iface_gen.resolve,
+                std::slice::from_ref(result),
+                &["this.result".into()],
+                true,
+                &mut bindgen,
+            );
+            for line in bindgen.into_body().lines() {
+                writeln!(self.src, "      {line}").unwrap();
+            }
+            writeln!(self.src, "    }}").unwrap();
+            let layout = self.world_gen.sizes.record([result]);
+            writeln!(
+                self.src,
+                "    ffi.cabi_realloc(this.result, {}, {}, 0);",
+                layout.size.size_wasm32(),
+                layout.align.align_wasm32()
+            )
+            .unwrap();
+        }
+        if wasm_sig.indirect_params {
+            let layout = self
+                .world_gen
+                .sizes
+                .record(func.params.iter().map(|p| &p.ty));
+            writeln!(
+                self.src,
+                "    ffi.cabi_realloc(this.a0, {}, {}, 0);",
+                layout.size.size_wasm32(),
+                layout.align.align_wasm32()
+            )
+            .unwrap();
+        }
+        writeln!(self.src, "    if (this.handle != 0) {{").unwrap();
+        writeln!(self.src, "      async_.waitableJoin(this.handle, 0);").unwrap();
+        writeln!(self.src, "      async_.subtaskDrop(this.handle);").unwrap();
+        writeln!(self.src, "      this.handle = 0;").unwrap();
+        writeln!(self.src, "    }}").unwrap();
+        writeln!(self.src, "    heap.free(changetype<usize>(this));").unwrap();
+        writeln!(self.src, "  }}").unwrap();
         writeln!(self.src, "}}").unwrap();
         writeln!(self.src).unwrap();
     }
@@ -1632,14 +1891,14 @@ impl FuncSig {
         self.user_signature(name)
     }
 
-    fn async_import_signature(&self, name: &str) -> String {
+    fn async_import_signature(&self, name: &str, func_local: &str) -> String {
         let ps = self
             .params
             .iter()
             .map(|(n, t)| format!("{n}: {t}"))
             .collect::<Vec<_>>()
             .join(", ");
-        format!("{name}({ps}): i32")
+        format!("{name}({ps}): {}Subtask", ident::type_name(func_local))
     }
 
     fn async_export_signature(&self, name: &str) -> String {
