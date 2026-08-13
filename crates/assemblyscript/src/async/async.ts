@@ -124,6 +124,22 @@ declare function __context_set_0(value: usize): void;
 @external("$root", "[context-get-0]")
 declare function __context_get_0(): usize;
 
+// @ts-ignore: imported from the canonical ABI core module.
+@external("$root", "[thread-yield]")
+declare function __thread_yield(): i32;
+
+// @ts-ignore: imported from the canonical ABI core module.
+@external("$root", "[error-context-new-utf8]")
+declare function __error_context_new_utf8(ptr: usize, len: usize): i32;
+
+// @ts-ignore: imported from the canonical ABI core module.
+@external("$root", "[error-context-drop]")
+declare function __error_context_drop(handle: i32): void;
+
+// @ts-ignore: imported from the canonical ABI core module.
+@external("$root", "[error-context-debug-message-utf8]")
+declare function __error_context_debug_message_utf8(handle: i32, retptr: usize): void;
+
 // ---------------------------------------------------------------------------
 // Waitable-set wrapper
 // ---------------------------------------------------------------------------
@@ -133,6 +149,9 @@ declare function __context_get_0(): usize;
 const __WAITABLE_PAYLOAD: usize = changetype<usize>(memory.data(8));
 
 export class WaitableSet {
+  waitable: i32 = 0;
+  code: i32 = 0;
+
   constructor(public handle: i32) {}
 
   static new(): WaitableSet {
@@ -143,28 +162,22 @@ export class WaitableSet {
     __waitable_join(waitable, this.handle);
   }
 
-  // Returns [event, waitable, code].
-  wait(): StaticArray<i32> {
+  wait(): i32 {
     store<i32>(__WAITABLE_PAYLOAD, 0);
     store<i32>(__WAITABLE_PAYLOAD + 4, 0);
     const event = __waitable_set_wait(this.handle, __WAITABLE_PAYLOAD);
-    const out = new StaticArray<i32>(3);
-    out[0] = event;
-    out[1] = load<i32>(__WAITABLE_PAYLOAD);
-    out[2] = load<i32>(__WAITABLE_PAYLOAD + 4);
-    return out;
+    this.waitable = load<i32>(__WAITABLE_PAYLOAD);
+    this.code = load<i32>(__WAITABLE_PAYLOAD + 4);
+    return event;
   }
 
-  // Returns [event, waitable, code].
-  poll(): StaticArray<i32> {
+  poll(): i32 {
     store<i32>(__WAITABLE_PAYLOAD, 0);
     store<i32>(__WAITABLE_PAYLOAD + 4, 0);
     const event = __waitable_set_poll(this.handle, __WAITABLE_PAYLOAD);
-    const out = new StaticArray<i32>(3);
-    out[0] = event;
-    out[1] = load<i32>(__WAITABLE_PAYLOAD);
-    out[2] = load<i32>(__WAITABLE_PAYLOAD + 4);
-    return out;
+    this.waitable = load<i32>(__WAITABLE_PAYLOAD);
+    this.code = load<i32>(__WAITABLE_PAYLOAD + 4);
+    return event;
   }
 
   drop(): void {
@@ -182,6 +195,22 @@ export function subtaskCancel(subtask: i32): i32 {
 
 export function subtaskDrop(subtask: i32): void {
   __subtask_drop(subtask);
+}
+
+export function waitableJoin(waitable: i32, set: i32): void {
+  __waitable_join(waitable, set);
+}
+
+export function waitableSetNew(): i32 {
+  return __waitable_set_new();
+}
+
+export function waitableSetWait(set: i32, payload: usize): i32 {
+  return __waitable_set_wait(set, payload);
+}
+
+export function waitableSetDrop(set: i32): void {
+  __waitable_set_drop(set);
 }
 
 export function backpressureInc(): void {
@@ -207,14 +236,65 @@ export function contextGet(): usize {
   return __context_get_0();
 }
 
+export function threadYield(): void {
+  __thread_yield();
+}
+
+// ---------------------------------------------------------------------------
+// Error-context helpers
+// ---------------------------------------------------------------------------
+
+// The canonical debug-message operation returns an owned UTF-8 buffer through
+// a pointer/length pair. Keep the return area single-instance, like the other
+// small ABI result buffers in this runtime.
+const __ERROR_CONTEXT_RET: usize = changetype<usize>(memory.data(16));
+
+export class ErrorContext {
+  constructor(public handle: i32) {}
+
+  static new(debugMessage: string): ErrorContext {
+    const encoded = String.UTF8.encode(debugMessage);
+    const len = <usize>encoded.byteLength;
+    const ptr = changetype<usize>(encoded);
+    return new ErrorContext(__error_context_new_utf8(ptr, len));
+  }
+
+  debugMessage(): string {
+    store<usize>(__ERROR_CONTEXT_RET, 0);
+    store<usize>(__ERROR_CONTEXT_RET + sizeof<usize>(), 0);
+    __error_context_debug_message_utf8(this.handle, __ERROR_CONTEXT_RET);
+    const ptr = load<usize>(__ERROR_CONTEXT_RET);
+    const len = load<usize>(__ERROR_CONTEXT_RET + sizeof<usize>());
+    const message = len == 0 ? "" : String.UTF8.decodeUnsafe(ptr, len);
+    if (ptr != 0) heap.free(ptr);
+    return message;
+  }
+
+  drop(): void {
+    __error_context_drop(this.handle);
+  }
+}
+
+export function errorContextNew(debugMessage: string): i32 {
+  return ErrorContext.new(debugMessage).handle;
+}
+
+export function errorContextDrop(handle: i32): void {
+  __error_context_drop(handle);
+}
+
+export function errorContextDebugMessage(handle: i32): string {
+  return new ErrorContext(handle).debugMessage();
+}
+
 // ---------------------------------------------------------------------------
 // Explicit stackless task API
 // ---------------------------------------------------------------------------
 
 // Implementations own their state and decide how each canonical event advances
-// it. Completion must call the generated taskReturn helper before returning
-// CALLBACK_CODE_EXIT. Return CALLBACK_CODE_YIELD to yield, or
-// callbackWait(set.handle) to wait.
+// it. Generated per-export task bases provide finish(), which records the
+// result for delivery after resume() has unwound. Return CALLBACK_CODE_YIELD to
+// yield, or callbackWait(set.handle) to wait.
 export abstract class AsyncTask {
   abstract resume(event: i32, waitable: i32, code: i32): i32;
 }
@@ -229,16 +309,24 @@ export class UnimplementedTask extends AsyncTask {
 // An async import starts a canonical subtask. The result address remains valid
 // until the caller has observed completion and lifted its result.
 export class AsyncSubtask {
-  readonly state: i32;
-  readonly handle: i32;
+  status: i32 = 0;
+  state: i32 = STATUS_STARTING;
+  handle: i32 = 0;
 
-  constructor(public status: i32, public result: usize) {
+  constructor(public result: usize) {}
+
+  start(status: i32): void {
+    this.status = status;
     this.state = subtaskState(status);
     this.handle = subtaskHandle(status);
   }
 
   join(set: WaitableSet): void {
     if (this.handle != 0) set.join(this.handle);
+  }
+
+  leave(): void {
+    if (this.handle != 0) __waitable_join(this.handle, 0);
   }
 
   cancel(): i32 {
@@ -250,29 +338,49 @@ export class AsyncSubtask {
   }
 }
 
-// Keep tasks rooted while the canonical ABI switches among context-0 values.
-// A single global task would resume the wrong state machine under reentrancy.
-const __tasks = new Map<usize, AsyncTask>();
+// Tasks are pinned in Scheduler.start and recovered from the context-0 pointer
+// via changetype. Pinning keeps the task alive across wait/event boundaries
+// (the incremental collector can run while the task is suspended); the pin is
+// released only after task.return has delivered the result (see release()).
+// A single global task would resume the wrong state machine under reentrancy,
+// so the current task always comes from the context slot.
 
 export class Scheduler {
+  @inline(false)
   static start(task: AsyncTask): i32 {
     const ptr = changetype<usize>(task);
-    __tasks.set(ptr, task);
+    // Pin the task so the incremental collector cannot reclaim it while it is
+    // suspended across wait/event boundaries. The pin is released only after
+    // task.return has delivered the result (see release()).
+    __pin(ptr);
     contextSet(ptr);
     return task.resume(EVENT_NONE, 0, 0);
   }
 
+  @inline(false)
   static resume(event: i32, waitable: i32, code: i32): i32 {
     const ptr = contextGet();
-    if (ptr == 0 || !__tasks.has(ptr)) return CALLBACK_CODE_EXIT;
-    const task = __tasks.get(ptr);
+    if (ptr == 0) return CALLBACK_CODE_EXIT;
+    const task = changetype<AsyncTask>(ptr);
     if (event == EVENT_CANCEL) taskCancel();
     return task.resume(event, waitable, code);
   }
 
-  static complete(): void {
+  static current(): AsyncTask {
     const ptr = contextGet();
-    if (ptr != 0) __tasks.delete(ptr);
+    assert(ptr != 0);
+    return changetype<AsyncTask>(ptr);
+  }
+
+  static release(): void {
+    // Unpin the task now that task.return has delivered its result. The
+    // incremental collector can run while task.return is delivering results,
+    // so the pin must stay in place until this point.
+    const ptr = contextGet();
+    if (ptr != 0) __unpin(ptr);
+  }
+
+  static complete(): void {
     contextSet(0);
   }
 

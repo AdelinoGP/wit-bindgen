@@ -5,6 +5,7 @@
 //! shared stackless runtime: waitable-set wrappers, event/status constants,
 //! subtask cancellation, backpressure, context helpers, and the explicit task
 //! scheduler. Per-function `task.return` intrinsics are emitted next to their
-//! exports. Future/stream payload endpoint operations are not generated yet.
+//! exports. Per-function future/stream endpoint intrinsics are emitted next to
+//! the generated interface functions that use them.
 
 pub const ASYNC_TS: &str = include_str!("./async/async.ts");

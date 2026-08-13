@@ -16,8 +16,8 @@
 //!
 //! Async callback bindings use an explicit stackless `AsyncTask` API because
 //! AssemblyScript has no native async/await. `future<T>`, `stream<T>`, and
-//! `error-context` remain opaque handles; payload read/write operations are not
-//! generated yet.
+//! `future<T>` and `stream<T>` remain opaque handles, with raw endpoint helpers
+//! exposing canonical payload pointers for explicit lifting and lowering.
 
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -25,9 +25,10 @@ use std::fmt::Write as _;
 use std::mem;
 use wit_bindgen_core::abi::{self, AbiVariant, Bindgen, Bitcast, Instruction, LiftLower, WasmType};
 use wit_bindgen_core::wit_parser::{
-    Alignment, ArchitectureSize, Docs, Enum, Flags, FlagsRepr, Function, Handle, InterfaceId,
-    LiftLowerAbi, Mangling, ManglingAndAbi, Record, Resolve, Result_, SizeAlign, Tuple, Type,
-    TypeDefKind, TypeId, TypeOwner, Variant, WasmExport, WasmExportKind, WorldId, WorldKey,
+    Alignment, ArchitectureSize, Docs, Enum, Flags, FlagsRepr, Function, FutureIntrinsic, Handle,
+    InterfaceId, LiftLowerAbi, Mangling, ManglingAndAbi, Record, Resolve, Result_, SizeAlign,
+    StreamIntrinsic, Tuple, Type, TypeDefKind, TypeId, TypeOwner, Variant, WasmExport,
+    WasmExportKind, WasmImport, WorldId, WorldKey,
 };
 use wit_bindgen_core::{
     AsyncFilterSet, Direction, Files, InterfaceGenerator as CoreInterfaceGenerator, WorldGenerator,
@@ -788,12 +789,18 @@ impl<'a> InterfaceGenerator<'a> {
             self.needs_async = true;
             self.world_gen.needs_async = true;
         }
-        let raw_extern_name = if is_async {
-            format!("[async-lower]{}", func.name)
-        } else {
-            func.name.clone()
-        };
-        let wasm_module = self.wasm_import_module(func);
+        self.emit_future_stream_helpers(func, false);
+        let (wasm_module, raw_extern_name) = self.resolve.wasm_import_name(
+            ManglingAndAbi::Legacy(if is_async {
+                LiftLowerAbi::AsyncCallback
+            } else {
+                LiftLowerAbi::Sync
+            }),
+            WasmImport::Func {
+                interface: self.interface_key.as_ref(),
+                func,
+            },
+        );
         let mangled_extern = format!("__ext_{}", sanitize_extern_local(&func_local));
 
         // Signature: emit @external `declare` + a friendly wrapper.
@@ -891,7 +898,7 @@ impl<'a> InterfaceGenerator<'a> {
                     ));
                 }
             }
-            let result_ptr = if let Some(result) = &func.result {
+            if let Some(result) = &func.result {
                 let layout = bindgen.iface_gen.world_gen.sizes.record([result]);
                 bindgen.push_line(&format!(
                     "const __result = ffi.cabi_realloc(0, 0, {}, {});",
@@ -899,16 +906,10 @@ impl<'a> InterfaceGenerator<'a> {
                     layout.size.size_wasm32()
                 ));
                 wasm_params.push("__result".into());
-                "__result"
-            } else {
-                "0"
-            };
+            }
             bindgen.push_line(&format!(
-                "const __status = {mangled_extern}({});",
+                "return {mangled_extern}({});",
                 wasm_params.join(", ")
-            ));
-            bindgen.push_line(&format!(
-                "return new async_.AsyncSubtask(__status, <usize>{result_ptr});"
             ));
             for line in bindgen.into_body().lines() {
                 writeln!(self.src, "  {line}").unwrap();
@@ -957,12 +958,17 @@ impl<'a> InterfaceGenerator<'a> {
             self.needs_async = true;
             self.world_gen.needs_async = true;
         }
+        self.emit_future_stream_helpers(func, true);
         let variant = if is_async {
             AbiVariant::GuestExportAsync
         } else {
             AbiVariant::GuestExport
         };
         let sig = self.func_signature(func, variant);
+
+        if is_async {
+            self.emit_async_task_base(func, &func_local, &sig);
+        }
 
         self.docs(&func.docs);
         if is_async {
@@ -979,7 +985,12 @@ impl<'a> InterfaceGenerator<'a> {
         };
         writeln!(self.src, "export function {user_sig} {{").unwrap();
         if is_async {
-            writeln!(self.src, "  return new async_.UnimplementedTask();").unwrap();
+            writeln!(
+                self.src,
+                "  return new {}Task();",
+                ident::type_name(&func_local)
+            )
+            .unwrap();
         } else {
             writeln!(self.src, "  // TODO: implement").unwrap();
             if let Some(ret_ty) = &sig.return_type {
@@ -1044,6 +1055,30 @@ impl<'a> InterfaceGenerator<'a> {
             wrapper_body.push_str(&bindgen.into_body());
         }
 
+        // Keep lifting and the managed task.resume frame out of the raw wasm
+        // export. task.return must run only after this helper has unwound.
+        if is_async {
+            let start_name = format!("__start_{unique_as_name}");
+            writeln!(
+                self.src,
+                "@inline(false)\nfunction {} {{",
+                sig.wasm_wrapper_signature(&start_name)
+            )
+            .unwrap();
+            for line in wrapper_body.lines() {
+                writeln!(self.src, "  {line}").unwrap();
+            }
+            writeln!(self.src, "}}").unwrap();
+            writeln!(self.src).unwrap();
+            wrapper_body = format!(
+                "const __status = {start_name}({});\nif (__finish_{unique_as_name}(__status)) {{ async_.Scheduler.release(); async_.Scheduler.complete(); }}\nreturn __status;",
+                (0..sig.wasm_params.len())
+                    .map(|i| format!("a{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+
         // Emit the wrapper into this file (exports/<basename>.ts).
         writeln!(self.src, "// wasm export: {wasm_name}").unwrap();
         writeln!(self.src, "export function {wrapper_sig} {{").unwrap();
@@ -1071,43 +1106,38 @@ impl<'a> InterfaceGenerator<'a> {
         }
     }
 
-    fn emit_async_export_support(&mut self, func: &Function, func_local: &str) {
-        let safe = sanitize_extern_local(&format!(
-            "{}_{}",
-            self.interface.map(|id| id.index()).unwrap_or(usize::MAX),
-            func_local
-        ));
-        let task_return_extern = format!("__task_return_{safe}");
-        let task_return_helper = format!("taskReturn{}", ident::type_name(func_local));
-        let (module, task_return_name, task_return_sig) =
+    fn emit_async_task_base(&mut self, func: &Function, func_local: &str, sig: &FuncSig) {
+        let task_type = format!("{}Task", ident::type_name(func_local));
+        let (_, _, task_return_sig) =
             func.task_return_import(self.resolve, self.interface_key.as_ref(), Mangling::Legacy);
         let task_return_types = task_return_sig.params;
-        let raw_params = task_return_types
-            .iter()
-            .enumerate()
-            .map(|(i, ty)| format!("a{i}: {}", wasm_type_name(*ty)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        writeln!(self.src, "@external(\"{module}\", \"{task_return_name}\")").unwrap();
         writeln!(
             self.src,
-            "declare function {task_return_extern}({raw_params}): void;"
+            "export class {task_type} extends async_.AsyncTask {{"
         )
         .unwrap();
-
-        if let Some(result) = &func.result {
-            let result_ty = self.type_ref(result);
-            writeln!(
-                self.src,
-                "export function {task_return_helper}(result: {result_ty}): void {{"
-            )
-            .unwrap();
+        writeln!(
+            self.src,
+            "  resume(_event: i32, _waitable: i32, _code: i32): i32 {{"
+        )
+        .unwrap();
+        writeln!(self.src, "    unreachable();").unwrap();
+        writeln!(self.src, "    return async_.CALLBACK_CODE_EXIT;").unwrap();
+        writeln!(self.src, "  }}").unwrap();
+        writeln!(self.src, "  finished: bool = false;").unwrap();
+        for (i, ty) in task_return_types.iter().enumerate() {
+            writeln!(self.src, "  return{i}: {} = 0;", wasm_type_name(*ty)).unwrap();
+        }
+        if func.result.is_some() {
+            let result_ty = sig.return_type.as_deref().unwrap();
+            writeln!(self.src, "  finish(result: {result_ty}): i32 {{").unwrap();
+            let result = func.result.as_ref().unwrap();
             let mut bindgen = FunctionBindgen::new(
                 self,
                 func,
                 AbiVariant::GuestExportAsync,
                 LiftLower::LowerArgsLiftResults,
-                task_return_extern.clone(),
+                "this.storeReturn".into(),
             );
             let args = if task_return_types == [WasmType::Pointer] {
                 let layout = bindgen.iface_gen.world_gen.sizes.record([result]);
@@ -1132,19 +1162,83 @@ impl<'a> InterfaceGenerator<'a> {
                     result,
                 )
             };
-            bindgen.push_line(&format!("{task_return_extern}({});", args.join(", ")));
-            bindgen.push_line("async_.Scheduler.complete();");
+            bindgen.push_line(&format!("this.storeReturn({});", args.join(", ")));
             for line in bindgen.into_body().lines() {
-                writeln!(self.src, "  {line}").unwrap();
+                writeln!(self.src, "    {line}").unwrap();
             }
-            writeln!(self.src, "}}").unwrap();
         } else {
-            writeln!(
-                self.src,
-                "export function {task_return_helper}(): void {{ {task_return_extern}(); async_.Scheduler.complete(); }}"
-            )
-            .unwrap();
+            writeln!(self.src, "  finish(): i32 {{").unwrap();
         }
+        writeln!(self.src, "    this.finished = true;").unwrap();
+        writeln!(self.src, "    return async_.CALLBACK_CODE_EXIT;").unwrap();
+        writeln!(self.src, "  }}").unwrap();
+        if !task_return_types.is_empty() {
+            let params = task_return_types
+                .iter()
+                .enumerate()
+                .map(|(i, ty)| format!("a{i}: {}", wasm_type_name(*ty)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            writeln!(self.src, "  private storeReturn({params}): void {{").unwrap();
+            for i in 0..task_return_types.len() {
+                writeln!(self.src, "    this.return{i} = a{i};").unwrap();
+            }
+            writeln!(self.src, "  }}").unwrap();
+        }
+        writeln!(self.src, "}}").unwrap();
+        writeln!(self.src).unwrap();
+    }
+
+    fn emit_async_export_support(&mut self, func: &Function, func_local: &str) {
+        let safe = sanitize_extern_local(&format!(
+            "{}_{}",
+            self.interface.map(|id| id.index()).unwrap_or(usize::MAX),
+            func_local
+        ));
+        let task_return_extern = format!("__task_return_{safe}");
+        let task_type = format!("{}Task", ident::type_name(func_local));
+        let finish_name = format!("__finish___exp_{safe}");
+        let (module, task_return_name, task_return_sig) =
+            func.task_return_import(self.resolve, self.interface_key.as_ref(), Mangling::Legacy);
+        let task_return_types = task_return_sig.params;
+        let raw_params = task_return_types
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| format!("a{i}: {}", wasm_type_name(*ty)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(self.src, "@external(\"{module}\", \"{task_return_name}\")").unwrap();
+        writeln!(
+            self.src,
+            "declare function {task_return_extern}({raw_params}): void;"
+        )
+        .unwrap();
+
+        let return_args = (0..task_return_types.len())
+            .map(|i| {
+                format!(
+                    "load<{}>(task + offsetof<{task_type}>(\"return{i}\"))",
+                    wasm_type_name(task_return_types[i])
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(
+            self.src,
+            "@inline(false)\nexport function {finish_name}(status: i32): bool {{"
+        )
+        .unwrap();
+        writeln!(self.src, "  const task = async_.contextGet();").unwrap();
+        writeln!(
+            self.src,
+            "  if (status == async_.CALLBACK_CODE_EXIT && task != 0 && load<bool>(task + offsetof<{task_type}>(\"finished\"))) {{"
+        )
+        .unwrap();
+        writeln!(self.src, "    {task_return_extern}({return_args});").unwrap();
+        writeln!(self.src, "    return true;").unwrap();
+        writeln!(self.src, "  }}").unwrap();
+        writeln!(self.src, "  return false;").unwrap();
+        writeln!(self.src, "}}").unwrap();
         writeln!(self.src).unwrap();
 
         let callback_name = self.wasm_export_name(func, true, WasmExportKind::Callback);
@@ -1156,9 +1250,15 @@ impl<'a> InterfaceGenerator<'a> {
         .unwrap();
         writeln!(
             self.src,
-            "  return async_.Scheduler.resume(event, waitable, code);"
+            "  const status = async_.Scheduler.resume(event, waitable, code);"
         )
         .unwrap();
+        writeln!(
+            self.src,
+            "  if ({finish_name}(status)) {{ async_.Scheduler.release(); async_.Scheduler.complete(); }}"
+        )
+        .unwrap();
+        writeln!(self.src, "  return status;").unwrap();
         writeln!(self.src, "}}").unwrap();
         writeln!(self.src).unwrap();
         let basename = self
@@ -1173,11 +1273,79 @@ impl<'a> InterfaceGenerator<'a> {
         });
     }
 
-    fn wasm_import_module(&self, _func: &Function) -> String {
-        match &self.interface_key {
-            Some(key) => self.resolve.name_world_key(key),
-            None => "$root".to_string(),
+    fn emit_future_stream_helpers(&mut self, func: &Function, exported: bool) {
+        for (index, ty) in func
+            .find_futures_and_streams(self.resolve)
+            .into_iter()
+            .enumerate()
+        {
+            let (kind, intrinsic_ty) = match &self.resolve.types[ty].kind {
+                TypeDefKind::Future(payload) => {
+                    (EndpointKind::Future, payload.as_ref().map(|_| ty))
+                }
+                TypeDefKind::Stream(payload) => {
+                    (EndpointKind::Stream, payload.as_ref().map(|_| ty))
+                }
+                _ => unreachable!(),
+            };
+            self.emit_future_stream_helper(func, exported, index, kind, intrinsic_ty);
         }
+    }
+
+    fn emit_future_stream_helper(
+        &mut self,
+        func: &Function,
+        exported: bool,
+        index: usize,
+        kind: EndpointKind,
+        intrinsic_ty: Option<TypeId>,
+    ) {
+        let stem = format!(
+            "raw{}{}{}{index}",
+            if exported { "Export" } else { "Import" },
+            ident::type_name(&Self::func_ident(&func.name)),
+            kind.type_name()
+        );
+        for intrinsic in EndpointIntrinsic::ALL {
+            let import = match kind {
+                EndpointKind::Future => WasmImport::FutureIntrinsic {
+                    interface: self.interface_key.as_ref(),
+                    func,
+                    ty: intrinsic_ty,
+                    intrinsic: intrinsic.future(),
+                    exported,
+                    async_: intrinsic.async_lowered(),
+                },
+                EndpointKind::Stream => WasmImport::StreamIntrinsic {
+                    interface: self.interface_key.as_ref(),
+                    func,
+                    ty: intrinsic_ty,
+                    intrinsic: intrinsic.stream(),
+                    exported,
+                    async_: intrinsic.async_lowered(),
+                },
+            };
+            let (module, field) = self
+                .resolve
+                .wasm_import_name(ManglingAndAbi::Legacy(LiftLowerAbi::Sync), import);
+            let operation = intrinsic.type_name();
+            let extern_name = format!("__{stem}{operation}");
+            let helper_name = format!("{stem}{operation}");
+            let (params, args, result) = intrinsic.signature(kind);
+            writeln!(self.src, "@external(\"{module}\", \"{field}\")").unwrap();
+            writeln!(
+                self.src,
+                "declare function {extern_name}({params}): {result};"
+            )
+            .unwrap();
+            writeln!(
+                self.src,
+                "export function {helper_name}({params}): {result} {{ {}{extern_name}({args}); }}",
+                if result == "void" { "" } else { "return " }
+            )
+            .unwrap();
+        }
+        writeln!(self.src).unwrap();
     }
 
     fn wasm_export_name(&self, func: &Function, is_async: bool, kind: WasmExportKind) -> String {
@@ -1212,6 +1380,103 @@ impl<'a> InterfaceGenerator<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum EndpointKind {
+    Future,
+    Stream,
+}
+
+impl EndpointKind {
+    fn type_name(self) -> &'static str {
+        match self {
+            Self::Future => "Future",
+            Self::Stream => "Stream",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum EndpointIntrinsic {
+    New,
+    Read,
+    Write,
+    CancelRead,
+    CancelWrite,
+    DropReadable,
+    DropWritable,
+}
+
+impl EndpointIntrinsic {
+    const ALL: [Self; 7] = [
+        Self::New,
+        Self::Read,
+        Self::Write,
+        Self::CancelRead,
+        Self::CancelWrite,
+        Self::DropReadable,
+        Self::DropWritable,
+    ];
+
+    fn type_name(self) -> &'static str {
+        match self {
+            Self::New => "New",
+            Self::Read => "Read",
+            Self::Write => "Write",
+            Self::CancelRead => "CancelRead",
+            Self::CancelWrite => "CancelWrite",
+            Self::DropReadable => "DropReadable",
+            Self::DropWritable => "DropWritable",
+        }
+    }
+
+    fn async_lowered(self) -> bool {
+        matches!(
+            self,
+            Self::Read | Self::Write | Self::CancelRead | Self::CancelWrite
+        )
+    }
+
+    fn future(self) -> FutureIntrinsic {
+        match self {
+            Self::New => FutureIntrinsic::New,
+            Self::Read => FutureIntrinsic::Read,
+            Self::Write => FutureIntrinsic::Write,
+            Self::CancelRead => FutureIntrinsic::CancelRead,
+            Self::CancelWrite => FutureIntrinsic::CancelWrite,
+            Self::DropReadable => FutureIntrinsic::DropReadable,
+            Self::DropWritable => FutureIntrinsic::DropWritable,
+        }
+    }
+
+    fn stream(self) -> StreamIntrinsic {
+        match self {
+            Self::New => StreamIntrinsic::New,
+            Self::Read => StreamIntrinsic::Read,
+            Self::Write => StreamIntrinsic::Write,
+            Self::CancelRead => StreamIntrinsic::CancelRead,
+            Self::CancelWrite => StreamIntrinsic::CancelWrite,
+            Self::DropReadable => StreamIntrinsic::DropReadable,
+            Self::DropWritable => StreamIntrinsic::DropWritable,
+        }
+    }
+
+    fn signature(self, kind: EndpointKind) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Self::New => ("", "", "i64"),
+            Self::Read | Self::Write => match kind {
+                EndpointKind::Future => ("handle: i32, payload: usize", "handle, payload", "i32"),
+                EndpointKind::Stream => (
+                    "handle: i32, payload: usize, count: usize",
+                    "handle, payload, count",
+                    "i32",
+                ),
+            },
+            Self::CancelRead | Self::CancelWrite => ("handle: i32", "handle", "i32"),
+            Self::DropReadable | Self::DropWritable => ("handle: i32", "handle", "void"),
+        }
+    }
+}
+
 struct FuncSig {
     params: Vec<(String, String)>,
     return_type: Option<String>,
@@ -1241,7 +1506,7 @@ impl FuncSig {
             .map(|(n, t)| format!("{n}: {t}"))
             .collect::<Vec<_>>()
             .join(", ");
-        format!("{name}({ps}): async_.AsyncSubtask")
+        format!("{name}({ps}): i32")
     }
 
     fn async_export_signature(&self, name: &str) -> String {
@@ -1251,7 +1516,7 @@ impl FuncSig {
             .map(|(n, t)| format!("{n}: {t}"))
             .collect::<Vec<_>>()
             .join(", ");
-        format!("{name}({ps}): async_.AsyncTask")
+        format!("{name}({ps}): {}Task", ident::type_name(name))
     }
 
     fn wasm_wrapper_signature(&self, name: &str) -> String {
