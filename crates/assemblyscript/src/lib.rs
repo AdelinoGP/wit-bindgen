@@ -1034,6 +1034,21 @@ impl<'a> InterfaceGenerator<'a> {
         writeln!(self.src, "    }}").unwrap();
         writeln!(self.src, "  }}").unwrap();
 
+        writeln!(self.src, "  cancel(): i32 {{").unwrap();
+        writeln!(
+            self.src,
+            "    if (!this.started || this.finished || this.handle == 0) unreachable();"
+        )
+        .unwrap();
+        writeln!(
+            self.src,
+            "    const status = async_.subtaskCancel(this.handle);"
+        )
+        .unwrap();
+        writeln!(self.src, "    this.update(status);").unwrap();
+        writeln!(self.src, "    return status;").unwrap();
+        writeln!(self.src, "  }}").unwrap();
+
         writeln!(self.src, "  private releaseParams(own: bool): void {{").unwrap();
         writeln!(self.src, "    if (this.paramsReleased) return;").unwrap();
         writeln!(self.src, "    this.paramsReleased = true;").unwrap();
@@ -1157,6 +1172,11 @@ impl<'a> InterfaceGenerator<'a> {
                 LiftLower::LowerArgsLiftResults,
                 String::new(),
             );
+            let mut params_only = func.clone();
+            params_only.result = None;
+            bindgen.next_endpoint = params_only
+                .find_futures_and_streams(bindgen.iface_gen.resolve)
+                .len();
             abi::deallocate_lists_and_own_in_types(
                 bindgen.iface_gen.resolve,
                 std::slice::from_ref(result),
@@ -2394,6 +2414,8 @@ struct FunctionBindgen<'a, 'b> {
     call_target: String,
     /// Counter for fresh local-variable names.
     next_local: u32,
+    /// Next future/stream occurrence in the function's canonical endpoint order.
+    next_endpoint: usize,
     /// Output source written into the current block. Blocks accumulate into
     /// `block_stack` when `push_block`/`finish_block` is called.
     src: String,
@@ -2419,6 +2441,7 @@ impl<'a, 'b> FunctionBindgen<'a, 'b> {
             lift_lower,
             call_target,
             next_local: 0,
+            next_endpoint: 0,
             src: String::new(),
             blocks: Vec::new(),
             block_storage: Vec::new(),
@@ -3397,8 +3420,43 @@ impl<'a, 'b> Bindgen for FunctionBindgen<'a, 'b> {
                 let _ = operands;
             }
 
-            Instruction::DropHandle { .. } => {
-                let _ = operands;
+            Instruction::DropHandle { ty } => {
+                let Type::Id(id) = ty else {
+                    let _ = operands;
+                    return;
+                };
+                let id = wit_bindgen_core::dealias(self.iface_gen.resolve, *id);
+                let kind = match &self.iface_gen.resolve.types[id].kind {
+                    TypeDefKind::Future(_) => EndpointKind::Future,
+                    TypeDefKind::Stream(_) => EndpointKind::Stream,
+                    _ => {
+                        let _ = operands;
+                        return;
+                    }
+                };
+                let index = self.next_endpoint;
+                self.next_endpoint += 1;
+                let endpoint = self
+                    .func
+                    .find_futures_and_streams(self.iface_gen.resolve)
+                    .get(index)
+                    .copied()
+                    .expect("DropHandle has no matching function endpoint occurrence");
+                assert_eq!(
+                    wit_bindgen_core::dealias(self.iface_gen.resolve, endpoint),
+                    id
+                );
+                let stem = format!(
+                    "raw{}{}{}{index}",
+                    if self.iface_gen.direction == Direction::Export {
+                        "Export"
+                    } else {
+                        "Import"
+                    },
+                    ident::type_name(&InterfaceGenerator::func_ident(&self.func.name)),
+                    kind.type_name()
+                );
+                self.push_line(&format!("{stem}DropReadable({});", operands[0]));
             }
 
             // Explicit AsyncTask implementations call the generated taskReturn
@@ -3525,6 +3583,19 @@ mod tests {
     use super::*;
     use wit_bindgen_core::wit_parser::{FunctionKind, Param, Stability, TypeDef};
 
+    fn generate(wit: &str, world: &str, opts: Opts) -> Files {
+        let mut resolve = Resolve::default();
+        let pkg = resolve.push_str("test.wit", wit).unwrap();
+        let world = resolve.select_world(&[pkg], Some(world)).unwrap();
+        let mut files = Files::default();
+        let mut generator = AssemblyScript {
+            opts,
+            ..AssemblyScript::default()
+        };
+        generator.generate(&mut resolve, world, &mut files).unwrap();
+        files
+    }
+
     fn future_type(resolve: &mut Resolve, payload: Option<Type>) -> TypeId {
         resolve.types.alloc(TypeDef {
             name: None,
@@ -3593,5 +3664,44 @@ mod tests {
         assert!(field(FutureIntrinsic::Write, true).contains("async-lower"));
         assert!(!field(FutureIntrinsic::CancelRead, false).contains("async-lower"));
         assert!(!field(FutureIntrinsic::CancelWrite, false).contains("async-lower"));
+    }
+
+    #[test]
+    fn async_import_drop_helpers_follow_duplicate_endpoint_occurrences() {
+        let files = generate(
+            r#"
+                package test:bindings;
+
+                interface api {
+                    type f = future<u32>;
+                    run: func(a: f, b: f) -> f;
+                }
+
+                world test-world {
+                    import api;
+                }
+            "#,
+            "test-world",
+            Opts {
+                async_: AsyncFilterSet::all(true),
+                ..Opts::default()
+            },
+        );
+        let generated = files
+            .iter()
+            .filter_map(|(_, contents)| std::str::from_utf8(contents).ok())
+            .find(|contents| contents.contains("class RunSubtask"))
+            .expect("generated async import subtask");
+
+        let param0 = generated
+            .find("rawImportRunFuture0DropReadable((<i32>this.a0));")
+            .expect("first parameter uses endpoint helper 0");
+        let param1 = generated
+            .find("rawImportRunFuture1DropReadable((<i32>this.a1));")
+            .expect("second parameter uses endpoint helper 1");
+        let result = generated
+            .find("rawImportRunFuture2DropReadable((<i32>load<i32>(this.result + 0)))")
+            .expect("result uses endpoint helper 2");
+        assert!(param0 < param1 && param1 < result);
     }
 }
