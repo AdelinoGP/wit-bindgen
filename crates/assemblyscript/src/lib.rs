@@ -3503,18 +3503,17 @@ impl<'a, 'b> Bindgen for FunctionBindgen<'a, 'b> {
                         return;
                     }
                 };
-                let index = self.next_endpoint;
-                self.next_endpoint += 1;
-                let endpoint = self
-                    .func
-                    .find_futures_and_streams(self.iface_gen.resolve)
-                    .get(index)
-                    .copied()
+                let endpoints = self.func.find_futures_and_streams(self.iface_gen.resolve);
+                let index = endpoints
+                    .iter()
+                    .enumerate()
+                    .skip(self.next_endpoint)
+                    .find_map(|(index, endpoint)| {
+                        (wit_bindgen_core::dealias(self.iface_gen.resolve, *endpoint) == id)
+                            .then_some(index)
+                    })
                     .expect("DropHandle has no matching function endpoint occurrence");
-                assert_eq!(
-                    wit_bindgen_core::dealias(self.iface_gen.resolve, endpoint),
-                    id
-                );
+                self.next_endpoint = index + 1;
                 let stem = format!(
                     "raw{}{}{}{index}",
                     if self.iface_gen.direction == Direction::Export {
