@@ -2490,7 +2490,13 @@ impl<'a, B: Bindgen> Generator<'a, B> {
                 TypeDefKind::Resource => unreachable!(),
                 TypeDefKind::Unknown => unreachable!(),
 
-                TypeDefKind::FixedLengthList(..) => todo!(),
+                TypeDefKind::FixedLengthList(element, size) => {
+                    // Fixed-length lists are flattened in the canonical ABI,
+                    // so dispose each element in reverse stack order.
+                    for _ in 0..*size {
+                        self.deallocate(element, what);
+                    }
+                }
             },
         }
     }
@@ -2627,7 +2633,21 @@ impl<'a, B: Bindgen> Generator<'a, B> {
                 TypeDefKind::Future(_) => unreachable!(),
                 TypeDefKind::Stream(_) => unreachable!(),
                 TypeDefKind::Unknown => unreachable!(),
-                TypeDefKind::FixedLengthList(_, _) => {}
+                TypeDefKind::FixedLengthList(element, size) => {
+                    let element_size = self.bindgen.sizes().size(element);
+                    for i in 0..*size {
+                        let element_offset = ArchitectureSize::new(
+                            element_size.bytes * i as usize,
+                            element_size.pointers * i as usize,
+                        );
+                        self.deallocate_indirect(
+                            element,
+                            addr.clone(),
+                            offset + element_offset,
+                            what,
+                        );
+                    }
+                }
             },
         }
     }
