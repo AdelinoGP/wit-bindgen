@@ -34,10 +34,10 @@ use std::fmt::Write as _;
 use std::mem;
 use wit_bindgen_core::abi::{self, AbiVariant, Bindgen, Bitcast, Instruction, LiftLower, WasmType};
 use wit_bindgen_core::wit_parser::{
-    Alignment, ArchitectureSize, Docs, Enum, Flags, FlagsRepr, Function, FutureIntrinsic, Handle,
-    InterfaceId, LiftLowerAbi, Mangling, ManglingAndAbi, Record, Resolve, ResourceIntrinsic,
-    Result_, SizeAlign, StreamIntrinsic, Tuple, Type, TypeDefKind, TypeId, TypeOwner, Variant,
-    WasmExport, WasmExportKind, WasmImport, WorldId, WorldKey,
+    Alignment, ArchitectureSize, Docs, Enum, Flags, FlagsRepr, Function, FunctionKind,
+    FutureIntrinsic, Handle, InterfaceId, LiftLowerAbi, Mangling, ManglingAndAbi, Record, Resolve,
+    ResourceIntrinsic, Result_, SizeAlign, StreamIntrinsic, Tuple, Type, TypeDefKind, TypeId,
+    TypeOwner, Variant, WasmExport, WasmExportKind, WasmImport, WorldId, WorldKey,
 };
 use wit_bindgen_core::{
     AsyncFilterSet, Direction, Files, InterfaceGenerator as CoreInterfaceGenerator, WorldGenerator,
@@ -1421,8 +1421,17 @@ impl<'a> InterfaceGenerator<'a> {
 
     fn gen_export_function(&mut self, func: &Function) {
         let func_local = Self::func_ident(&func.name);
-        let user_ident = strip_resource_prefix(&func.name);
-        let user_ident = ident::value_name(user_ident);
+        // Resource-associated functions keep their `[method]`/`[static]`/
+        // `[constructor]` qualification: two resources in one interface can
+        // both define `get-a`, and stripping the prefix collided them into a
+        // single `getA` that `asc` rejects as a duplicate identifier. The
+        // resulting names match what the import side already emits.
+        let user_ident = match func.kind {
+            FunctionKind::Freestanding | FunctionKind::AsyncFreestanding => {
+                ident::value_name(strip_resource_prefix(&func.name))
+            }
+            _ => func_local.clone(),
+        };
 
         // 1. Stub in exports/<iface>.ts: the user-edited entrypoint.
         let is_async = self.world_gen.opts.async_.is_async(
@@ -4358,7 +4367,7 @@ fn bitcast_expr(cast: &Bitcast, op: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wit_bindgen_core::wit_parser::{FunctionKind, Param, Stability, TypeDef};
+    use wit_bindgen_core::wit_parser::{Param, Stability, TypeDef};
 
     fn generate(wit: &str, world: &str, opts: Opts) -> Files {
         let mut resolve = Resolve::default();
@@ -4487,9 +4496,9 @@ mod tests {
         assert!(glue.contains("export function __callback_"));
         assert!(glue.contains("export function __finish___exp_"));
         assert!(glue.contains("export class RunTask"));
-        assert!(
-            glue.contains("import { Item, item, plain, run } from \"../stubs/test$bindings$api\";")
-        );
+        assert!(glue.contains(
+            "import { Item, constructorItem, plain, run } from \"../stubs/test$bindings$api\";",
+        ));
         // ...and nothing the user is meant to edit.
         assert!(!glue.contains("// TODO: implement"));
         assert!(!glue.contains("/* user fields */"));
@@ -4822,6 +4831,56 @@ mod tests {
             );
         }
         assert!(body.contains("const __v0 ="));
+    }
+
+    /// Export stubs used to strip the `[method]`/`[static]`/`[constructor]`
+    /// qualification, so two resources in one interface that both define
+    /// `get-a` collapsed into a single `getA` and `asc` rejected the file with
+    /// "Duplicate identifier". A free function named after a static was the
+    /// same story.
+    #[test]
+    fn resource_methods_do_not_collide_across_resources() {
+        let files = generate(
+            r#"
+                package test:bindings;
+
+                interface api {
+                    resource x {
+                        constructor(a: s32);
+                        get-a: func() -> s32;
+                        add: static func(x: x, a: s32) -> x;
+                    }
+                    resource z {
+                        constructor(a: s32);
+                        get-a: func() -> s32;
+                    }
+                    add: func(a: borrow<z>, b: borrow<z>) -> z;
+                }
+
+                world test-world {
+                    export api;
+                }
+            "#,
+            "test-world",
+            Opts::default(),
+        );
+        let stub = file(&files, "stubs/test$bindings$api.ts");
+
+        let mut names: Vec<&str> = stub
+            .lines()
+            .filter_map(|line| line.strip_prefix("export function "))
+            .filter_map(|rest| rest.split('(').next())
+            .collect();
+        let before = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(before, names.len(), "duplicate stub names: {names:?}");
+
+        assert!(stub.contains("export function methodXGetA(self: X): i32 {"));
+        assert!(stub.contains("export function methodZGetA(self: Z): i32 {"));
+        assert!(stub.contains("export function staticXAdd("));
+        // A freestanding function keeps its plain name.
+        assert!(stub.contains("export function add(a: Z, b: Z): Z {"));
     }
 
     #[test]

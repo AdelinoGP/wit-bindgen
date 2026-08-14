@@ -6,6 +6,6 @@ export class Bar {
   __onDrop(): void {}
 }
 
-export function bar(): Bar {
+export function constructorBar(): Bar {
   return new Bar();
 }

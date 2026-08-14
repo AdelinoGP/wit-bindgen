@@ -6,7 +6,7 @@ export class Thing {
   __onDrop(): void {}
 }
 
-export function thing(v: u32): Thing {
+export function constructorThing(v: u32): Thing {
   return new Thing(v + 1);
 }
 

@@ -6,18 +6,18 @@ export class Thing {
   __onDrop(): void {}
 }
 
-export function thing(v: u32): Thing {
+export function constructorThing(v: u32): Thing {
   return new Thing(v + 1);
 }
 
-export function foo(self: Thing): u32 {
+export function methodThingFoo(self: Thing): u32 {
   return self.value + 2;
 }
 
-export function bar(self: Thing, v: u32): void {
+export function methodThingBar(self: Thing, v: u32): void {
   self.value = v + 3;
 }
 
-export function baz(a: Thing, b: Thing): Thing {
-  return new Thing(foo(a) + foo(b) + 4 + 1);
+export function staticThingBaz(a: Thing, b: Thing): Thing {
+  return new Thing(methodThingFoo(a) + methodThingFoo(b) + 4 + 1);
 }

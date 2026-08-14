@@ -14,19 +14,19 @@ function wrap(handle: i32): I.Thing {
   return new I.Thing(handle);
 }
 
-export function thing(v: u32): Thing {
+export function constructorThing(v: u32): Thing {
   return new Thing(I.constructorThing(v + 1).handle);
 }
 
-export function foo(self: Thing): u32 {
+export function methodThingFoo(self: Thing): u32 {
   return I.methodThingFoo(wrap(self.inner)) + 2;
 }
 
-export function bar(self: Thing, v: u32): void {
+export function methodThingBar(self: Thing, v: u32): void {
   I.methodThingBar(wrap(self.inner), v + 3);
 }
 
-export function baz(a: Thing, b: Thing): Thing {
+export function staticThingBaz(a: Thing, b: Thing): Thing {
   const combined = I.staticThingBaz(wrap(a.inner), wrap(b.inner));
   const result = I.methodThingFoo(combined) + 4;
   combined.drop();

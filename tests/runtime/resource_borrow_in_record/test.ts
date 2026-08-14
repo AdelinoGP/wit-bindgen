@@ -8,11 +8,11 @@ export class Thing {
   __onDrop(): void {}
 }
 
-export function thing(s: string): Thing {
+export function constructorThing(s: string): Thing {
   return new Thing(s + " new");
 }
 
-export function get_(self: Thing): string {
+export function methodThingGet(self: Thing): string {
   return self.contents + " get";
 }
 

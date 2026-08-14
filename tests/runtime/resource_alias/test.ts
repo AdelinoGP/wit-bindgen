@@ -8,7 +8,7 @@ export class X {
   __onDrop(): void {}
 }
 
-export function x(v: u32): X {
+export function constructorX(v: u32): X {
   return new X(v);
 }
 
