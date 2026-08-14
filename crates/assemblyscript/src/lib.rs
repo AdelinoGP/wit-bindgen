@@ -1517,6 +1517,7 @@ impl<'a> InterfaceGenerator<'a> {
             );
             wrapper_body.push_str(&bindgen.into_body());
         } else {
+            let cleanup = self.sync_export_param_cleanup(func);
             let user_call = user_ident.clone();
             let mut bindgen = FunctionBindgen::new(
                 self,
@@ -1525,6 +1526,7 @@ impl<'a> InterfaceGenerator<'a> {
                 LiftLower::LiftArgsLowerResults,
                 user_call,
             );
+            bindgen.after_call = cleanup;
             abi::call(
                 bindgen.iface_gen.resolve,
                 AbiVariant::GuestExport,
@@ -1584,7 +1586,104 @@ impl<'a> InterfaceGenerator<'a> {
 
         if is_async {
             self.emit_async_export_support(func, &func_local, &user_ident);
+        } else {
+            self.emit_post_return(func, &func_local);
         }
+    }
+
+    /// Release what the caller transferred with a synchronous export's
+    /// parameters: list and string buffers (lifting copies them, so nothing
+    /// else frees them), error contexts, and owned handles.
+    ///
+    /// Emitted immediately after the user call rather than before the return,
+    /// so that an owned exported-resource parameter handed straight back as the
+    /// result is released *before* the result acquires its new handle.
+    fn sync_export_param_cleanup(&mut self, func: &Function) -> String {
+        let types: Vec<Type> = func.params.iter().map(|p| p.ty).collect();
+        if types.is_empty() {
+            return String::new();
+        }
+        let wasm_sig = self.resolve.wasm_signature(AbiVariant::GuestExport, func);
+        let operands: Vec<String> = if wasm_sig.indirect_params {
+            vec!["a0".to_string()]
+        } else {
+            (0..wasm_sig.params.len())
+                .map(|i| format!("a{i}"))
+                .collect()
+        };
+        let mut bindgen = FunctionBindgen::new(
+            self,
+            func,
+            AbiVariant::GuestExport,
+            LiftLower::LiftArgsLowerResults,
+            String::new(),
+        );
+        // Distinct local prefix: these lines are spliced into the wrapper body,
+        // which numbers its own locals from `v0`.
+        bindgen.local_prefix = "d";
+        abi::deallocate_lists_and_own_in_types(
+            bindgen.iface_gen.resolve,
+            &types,
+            &operands,
+            wasm_sig.indirect_params,
+            &mut bindgen,
+        );
+        bindgen.into_body()
+    }
+
+    /// `cabi_post_*`: frees the linear memory the export handed back. Without
+    /// it every synchronous export returning a string or list leaks its
+    /// returned buffers.
+    fn emit_post_return(&mut self, func: &Function, func_local: &str) {
+        if !abi::guest_export_needs_post_return(self.resolve, func) {
+            return;
+        }
+        // A bare `-> error-context` result also reports "needs deallocate", but
+        // it is a flat i32 transferred to the caller, and `abi::post_return`
+        // requires a return pointer. Nothing to free in that case.
+        if !self
+            .resolve
+            .wasm_signature(AbiVariant::GuestExport, func)
+            .retptr
+        {
+            return;
+        }
+        let safe = sanitize_extern_local(&format!(
+            "{}_{}",
+            self.interface.map(|id| id.index()).unwrap_or(usize::MAX),
+            func_local
+        ));
+        let as_name = format!("__post_return_{safe}");
+        let wasm_name = self.wasm_export_name(func, false, WasmExportKind::PostReturn);
+
+        let mut bindgen = FunctionBindgen::new(
+            self,
+            func,
+            AbiVariant::GuestExport,
+            LiftLower::LiftArgsLowerResults,
+            String::new(),
+        );
+        abi::post_return(bindgen.iface_gen.resolve, func, &mut bindgen);
+        let body = bindgen.into_body();
+
+        writeln!(self.src, "// wasm export: {wasm_name}").unwrap();
+        writeln!(self.src, "export function {as_name}(a0: usize): void {{").unwrap();
+        for line in body.lines() {
+            writeln!(self.src, "  {line}").unwrap();
+        }
+        writeln!(self.src, "}}").unwrap();
+        writeln!(self.src).unwrap();
+
+        let basename = self
+            .interface
+            .and_then(|id| self.world_gen.export_basenames.get(&id).cloned())
+            .unwrap_or_default();
+        self.world_gen.exports.push(ExportEntry {
+            wasm_name,
+            as_name,
+            basename,
+            body: String::new(),
+        });
     }
 
     fn emit_async_task_base(&mut self, func: &Function, func_local: &str, sig: &FuncSig) {
@@ -2655,6 +2754,16 @@ struct FunctionBindgen<'a, 'b> {
     call_target: String,
     /// Counter for fresh local-variable names.
     next_local: u32,
+    /// Prefix for fresh local names. Bodies generated separately and spliced
+    /// into another body need their own prefix to avoid redeclaration.
+    local_prefix: &'static str,
+    /// Lines emitted straight after `CallInterface` on the synchronous export
+    /// path — parameter cleanup, which must run after the user call but before
+    /// the result is lowered.
+    after_call: String,
+    /// Lines emitted straight after `CallWasm` — release of buffers a
+    /// synchronous import only borrowed.
+    after_wasm_call: String,
     /// Next future/stream occurrence in the function's canonical endpoint order.
     next_endpoint: usize,
     /// Output source written into the current block. Blocks accumulate into
@@ -2682,6 +2791,9 @@ impl<'a, 'b> FunctionBindgen<'a, 'b> {
             lift_lower,
             call_target,
             next_local: 0,
+            local_prefix: "v",
+            after_call: String::new(),
+            after_wasm_call: String::new(),
             next_endpoint: 0,
             src: String::new(),
             blocks: Vec::new(),
@@ -2692,11 +2804,58 @@ impl<'a, 'b> FunctionBindgen<'a, 'b> {
     fn fresh(&mut self) -> String {
         let n = self.next_local;
         self.next_local += 1;
-        format!("v{n}")
+        format!("{}{n}", self.local_prefix)
     }
 
     fn into_body(self) -> String {
         self.src
+    }
+
+    /// Queue the release of a buffer that was allocated purely to hand a
+    /// synchronous import a borrowed view of a list. Runs after `CallWasm`.
+    fn free_borrowed_list(
+        &mut self,
+        buf: &str,
+        len: &str,
+        element: &Type,
+        size: usize,
+        align: usize,
+    ) {
+        // Generate the per-element deallocation into a scratch buffer so it can
+        // be replayed after the call rather than before it. `fresh()` keeps
+        // counting, so the names stay unique in the spliced body.
+        const BASE: &str = "__CLEANUP_BASE__";
+        let outer = mem::take(&mut self.src);
+        abi::deallocate_lists_in_types(
+            self.iface_gen.resolve,
+            &[*element],
+            &[BASE.to_string()],
+            true,
+            self,
+        );
+        let element_cleanup = mem::replace(&mut self.src, outer);
+
+        let mut cleanup = String::new();
+        if !element_cleanup.trim().is_empty() {
+            let i = self.fresh();
+            let base = self.fresh();
+            writeln!(cleanup, "for (let {i}: i32 = 0; {i} < {len}; {i}++) {{").unwrap();
+            writeln!(
+                cleanup,
+                "  const {base}: usize = {buf} + <usize>({i} * {size});"
+            )
+            .unwrap();
+            for line in element_cleanup.lines() {
+                writeln!(cleanup, "  {}", line.replace(BASE, &base)).unwrap();
+            }
+            writeln!(cleanup, "}}").unwrap();
+        }
+        writeln!(
+            cleanup,
+            "ffi.cabi_realloc({buf}, <usize>({len} * {size}), {align}, 0);"
+        )
+        .unwrap();
+        self.after_wasm_call.push_str(&cleanup);
     }
 
     /// Emit the per-element deallocation loop shared by list and map
@@ -2983,9 +3142,20 @@ impl<'a, 'b> Bindgen for FunctionBindgen<'a, 'b> {
                 if let Some(helper) = helper {
                     let ptr = self.fresh();
                     let len = self.fresh();
-                    self.push_line(&format!("const {ptr} = ffi.{helper}({arr_ref});"));
+                    if realloc.is_some() {
+                        // The callee takes ownership, so hand it a copy.
+                        self.push_line(&format!("const {ptr} = ffi.{helper}({arr_ref});"));
+                    } else {
+                        // `Realloc::None` means the callee only borrows for the
+                        // duration of the call, and nothing would ever free a
+                        // copy. Point at the array's own storage instead;
+                        // `arr_ref` is a named local, so it stays a GC root
+                        // across the call. Same discipline as `StringLower`.
+                        self.push_line(&format!(
+                            "const {ptr} = changetype<usize>({arr_ref}.dataStart);"
+                        ));
+                    }
                     self.push_line(&format!("const {len} = <i32>{arr_ref}.length;"));
-                    let _ = realloc;
                     results.push(ptr);
                     results.push(len);
                 } else {
@@ -3031,7 +3201,18 @@ impl<'a, 'b> Bindgen for FunctionBindgen<'a, 'b> {
                 ));
                 let (block_src, block_results) =
                     self.blocks.pop().expect("ListLower expects a block");
-                let _ = realloc;
+                // `Realloc::None` means the callee only borrows this buffer, so
+                // the caller has to release it — including any list or string
+                // an element lowered into linear memory.
+                //
+                // Only at the top level: `buf`/`len` for a nested list are
+                // loop-locals that no longer exist after the call, and the
+                // enclosing list's own cleanup already walks into its elements.
+                // A list nested inside a record or variant parameter is still
+                // not released.
+                if realloc.is_none() && self.block_storage.is_empty() {
+                    self.free_borrowed_list(&buf, &len, element, size, align.align_wasm32());
+                }
                 let i = self.fresh();
                 let base = self.fresh();
                 let elem = self.fresh();
@@ -3607,6 +3788,10 @@ impl<'a, 'b> Bindgen for FunctionBindgen<'a, 'b> {
                     // will issue `*Load` ops with the area pointer.
                     self.push_line(&format!("{}({args});", self.call_target));
                 }
+                let cleanup = mem::take(&mut self.after_wasm_call);
+                for line in cleanup.lines() {
+                    self.push_line(line);
+                }
             }
 
             Instruction::CallInterface { func, async_ } => {
@@ -3627,6 +3812,10 @@ impl<'a, 'b> Bindgen for FunctionBindgen<'a, 'b> {
                     results.push(r);
                 } else {
                     self.push_line(&format!("{}({args});", self.call_target));
+                }
+                let cleanup = mem::take(&mut self.after_call);
+                for line in cleanup.lines() {
+                    self.push_line(line);
                 }
             }
 
@@ -4114,6 +4303,117 @@ mod tests {
         assert!(file(&files, "exports/test$bindings$api.ts").contains("export function __exp_"));
     }
 
+    /// The backend had no post-return at all, so every synchronous export
+    /// returning a string or list leaked the buffers it handed back.
+    #[test]
+    fn sync_exports_returning_lists_emit_a_post_return() {
+        let files = generate(
+            r#"
+                package test:bindings;
+
+                world test-world {
+                    export greet: func() -> string;
+                    export count: func() -> u32;
+                }
+            "#,
+            "test-world",
+            Opts::default(),
+        );
+
+        let glue = file(&files, "world.ts");
+        assert!(glue.contains("// wasm export: cabi_post_greet"));
+        assert!(glue.contains(
+            "export function __post_return_18446744073709551615_greet(a0: usize): void {"
+        ));
+        // The returned string's buffer is freed from the return area.
+        assert!(glue.contains(
+            "ffi.cabi_realloc(load<usize>(a0 + 0), <usize>(load<usize>(a0 + 4) << 1), 2, 0);"
+        ));
+        // Scalar results own nothing, so no post-return is emitted for them.
+        assert!(!glue.contains("cabi_post_count"));
+
+        let renames = file(&files, "wit_bindgen_exports.json");
+        assert!(renames.contains("\"cabi_post_greet\""));
+    }
+
+    /// A synchronous export owns the buffers and handles the caller lowered
+    /// into its memory. Lifting copies, so without an explicit release every
+    /// string, list, error-context, and owned handle parameter leaked.
+    #[test]
+    fn sync_export_parameters_are_released_after_the_user_call() {
+        let files = generate(
+            r#"
+                package test:bindings;
+
+                world test-world {
+                    export take: func(a: string, b: list<u32>);
+                }
+            "#,
+            "test-world",
+            Opts::default(),
+        );
+
+        let glue = file(&files, "world.ts");
+        let call = glue.find("take(").expect("user call");
+        let free_string = glue
+            .find("ffi.cabi_realloc(a0, <usize>(a1 << 1), 2, 0);")
+            .expect("string parameter buffer is freed");
+        let free_list = glue
+            .find("ffi.cabi_realloc(d0, <usize>(d1 * 4), 4, 0);")
+            .expect("list parameter buffer is freed");
+        assert!(
+            call < free_string && call < free_list,
+            "cleanup must follow the user call"
+        );
+    }
+
+    /// A synchronous import gets `Realloc::None` because the callee only
+    /// borrows. Numeric lists used to be copied into a `cabi_realloc` buffer
+    /// that nothing freed, and non-canonical lists leaked their whole lowered
+    /// buffer — one leak per list argument per call.
+    #[test]
+    fn sync_import_list_arguments_do_not_leak() {
+        let files = generate(
+            r#"
+                package test:bindings;
+
+                interface api {
+                    nums: func(a: list<u32>);
+                    strs: func(a: list<string>);
+                    owned: async func(a: list<u32>);
+                }
+
+                world test-world {
+                    import api;
+                }
+            "#,
+            "test-world",
+            Opts::default(),
+        );
+        let imports = file(&files, "imports/test$bindings$api.ts");
+
+        // Numeric list: borrowed in place rather than copied.
+        let nums = imports
+            .split("export function nums(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("sync numeric-list import");
+        assert!(nums.contains("changetype<usize>(v0.dataStart)"));
+        assert!(!nums.contains("u32ArrayLower"));
+
+        // Non-canonical list: the lowered buffer and each element's string
+        // buffer are released, and only after the call.
+        let call = imports.find("__ext_strs(").expect("import call");
+        let free_elems = imports
+            .find("ffi.cabi_realloc(load<usize>(v7 + 0), <usize>(load<usize>(v7 + 4) << 1), 2, 0);")
+            .expect("element string buffers freed");
+        assert!(call < free_elems);
+
+        // The async lowering hands ownership to the callee, so it must still
+        // copy and must not free at the call site.
+        assert!(imports.contains("ffi.u32ArrayLower("));
+    }
+
     #[test]
     fn async_import_drop_helpers_follow_duplicate_endpoint_occurrences() {
         let files = generate(
@@ -4209,6 +4509,13 @@ mod tests {
         assert!(generated.contains("async_.ErrorContext"));
         assert!(generated.contains("new async_.ErrorContext"));
         assert!(generated.contains(".handle"));
+        // The export receives an owned error-context. Lifting only wraps the
+        // handle, so the wrapper has to release it after the user call — this
+        // assertion is the point of the test and used to be missing.
+        assert!(
+            generated.contains("new async_.ErrorContext(<i32>a0).drop();"),
+            "an owned error-context parameter must be dropped"
+        );
     }
 
     /// An exiting async export must perform exactly one of `task.return` or
