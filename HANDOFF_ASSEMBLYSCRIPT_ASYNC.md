@@ -65,11 +65,61 @@ WIT_BINDGEN_AS_RUNTIME=minimal cargo run test --languages rust,assemblyscript te
   --artifacts target/a-min --rust-wit-bindgen-path ./crates/guest-rust
 ```
 
+### Writing a fixture
+
+Generate the bindings for the world first and read the stub it produces —
+guessing the mangled paths and names wastes time:
+
+```bash
+cargo run -q -- assemblyscript tests/runtime/<dir>/test.wit --world <world> --out-dir /tmp/gen
+ls /tmp/gen/stubs /tmp/gen/imports
+cat /tmp/gen/stubs/*.ts        # the signatures your fixture must match
+```
+
+`//@ path` points at one of those `stubs/*.ts`. The basename mangling is
+`ident::iface_basename`: `:` `/` `@` become `$`, and `.` `-` become `_`, so
+`test:many-arguments/to-test` is `test$many_arguments$to_test` and
+`my:inline/foo@0.0.0` is `my$inline$foo$0_0_0`. World-level exports go to
+`stubs/world.ts`.
+
+The import side of the same WIT is `/tmp/gen/imports/<basename>.ts` — generate
+the `runner` world separately to see it. Resource functions are
+`constructorX` / `methodXGetA` / `staticXAdd` on both sides.
+
+Note that AssemblyScript accepts no `--generate-unused-types`: it always emits
+every type an interface declares, so a fixture copied from Rust must drop that
+`//@ args` line.
+
+### Localizing a wasm trap
+
+Release builds carry no name section, so a failing runtime test gives you
+`<wasm function 42>` and nothing else. Every guest-side failure is a bare
+`unreachable`, so the only way to tell two of them apart is to make one of them
+*not* trap:
+
+```ts
+function assert(condition: bool): void {
+  if (!condition) { while (true) {} }   // hangs instead of trapping
+}
+```
+
+A hang (the run takes its full timeout) means that site fired; a fast failure
+means something else did. Bisect by converting sites back to `unreachable()`
+one group at a time. The same trick works on the generator by editing what it
+emits — that is how item 1 below was narrowed to the generated task base's
+`resume`, and how a DROPPED-versus-COMPLETED stream event was identified.
+
+Two caveats. The trap may be in the *other* component: pair your fixture
+against the Rust one to find out which side is wrong. And `assert` in
+AssemblyScript routes through `ffi.abort`, so an allocator or bounds failure
+looks identical to a failed assertion — patch `abort` itself to loop if you
+need to tell those apart.
+
 ---
 
 # What Landed
 
-Six commits on top of `1318ec2b`.
+Eight commits on top of `1318ec2b`.
 
 ### `5495ebfd` — generated glue split from the user stub
 
@@ -142,6 +192,25 @@ is explicit — see `FunctionBindgen::export_param_cleanup`.
 `[method]`/`[static]`/`[constructor]` qualification collapsed them into one
 `getA` and `asc` rejected the file. Resource-associated stubs keep their
 qualification: `constructorX`, `methodXGetA`, `staticXAdd`.
+
+### `01562172` — typed stream payload helpers
+
+Futures had typed payload helpers on the task base; streams had only the raw
+endpoint imports. An exported `stream<T>` now gets `startStream<i>Read` /
+`finishStream<i>Read` and `startStream<i>Write` / `finishStream<i>Write`, backed
+by a growable element buffer on the task, so the payload is exchanged as an
+ordinary AssemblyScript list. This commit also rewrote this document.
+
+### `01070c74` — code-review follow-ups
+
+From a two-axis review of everything above. Removed inert scaffolding in
+`tuples_wider_than_sixteen_are_rejected`; made `gen_export_function` save and
+restore `emitting_stub` instead of clobbering it; sharpened
+`simple-call-import/runner.ts`, which had become byte-identical to
+`simple-pending-import/runner.ts` and no longer distinguished the two cases;
+folded the third copy of the `list<T>` typed-array mapping into
+`list_type_ref`; named the `AsyncParamCleanup` pair. Documented `// @@file:` in
+`crates/test/README.md`.
 
 ---
 
