@@ -11,10 +11,37 @@ pub struct AssemblyScript;
 struct LangConfig {
     /// Path under `bindings_dir` to write the user's test/runner file to.
     ///
-    /// E.g. `path = "exports/foo$foo$records.ts"` overwrites the generated
-    /// stub at that path with the user's implementation.
+    /// E.g. `path = "stubs/foo$foo$records.ts"` replaces the generated
+    /// user-implementation stub at that path.
+    ///
+    /// A world exporting several interfaces needs one file per interface. Split
+    /// the fixture with `// @@file: <path>` marker lines: everything before the
+    /// first marker goes to `path`, and each following section goes to the path
+    /// its marker names.
     #[serde(default)]
     path: String,
+}
+
+/// Marker introducing an additional output file inside a fixture.
+const FILE_MARKER: &str = "// @@file:";
+
+/// Split a fixture into `(path, contents)` pairs. The first section takes
+/// `default_path`; later sections take the path from their marker line.
+fn split_fixture(source: &str, default_path: &str) -> Vec<(String, String)> {
+    let mut files = Vec::new();
+    let mut path = default_path.to_string();
+    let mut body = String::new();
+    for line in source.lines() {
+        if let Some(next) = line.trim().strip_prefix(FILE_MARKER) {
+            files.push((std::mem::take(&mut path), std::mem::take(&mut body)));
+            path = next.trim().to_string();
+            continue;
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    files.push((path, body));
+    files
 }
 
 impl LanguageMethods for AssemblyScript {
@@ -68,18 +95,21 @@ impl LanguageMethods for AssemblyScript {
         // generated `exports/` tree.
         let cfg = compile.component.deserialize_lang_config::<LangConfig>()?;
         if !cfg.path.is_empty() {
-            let dest = compile.bindings_dir.join(&cfg.path);
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("unable to create `{}`", parent.display()))?;
-            }
-            std::fs::copy(&compile.component.path, &dest).with_context(|| {
-                format!(
-                    "failed to copy `{}` -> `{}`",
-                    compile.component.path.display(),
-                    dest.display()
-                )
+            let source = std::fs::read_to_string(&compile.component.path).with_context(|| {
+                format!("unable to read `{}`", compile.component.path.display())
             })?;
+            for (path, body) in split_fixture(&source, &cfg.path) {
+                if path.is_empty() {
+                    bail!("`{FILE_MARKER}` marker without a path");
+                }
+                let dest = compile.bindings_dir.join(&path);
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("unable to create `{}`", parent.display()))?;
+                }
+                std::fs::write(&dest, body)
+                    .with_context(|| format!("failed to write `{}`", dest.display()))?;
+            }
         }
 
         // Run asc, driven by the generated asconfig.json. `WIT_BINDGEN_AS_RUNTIME`

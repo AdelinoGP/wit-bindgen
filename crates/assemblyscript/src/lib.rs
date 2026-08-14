@@ -35,9 +35,9 @@ use std::mem;
 use wit_bindgen_core::abi::{self, AbiVariant, Bindgen, Bitcast, Instruction, LiftLower, WasmType};
 use wit_bindgen_core::wit_parser::{
     Alignment, ArchitectureSize, Docs, Enum, Flags, FlagsRepr, Function, FutureIntrinsic, Handle,
-    InterfaceId, LiftLowerAbi, Mangling, ManglingAndAbi, Record, Resolve, Result_, SizeAlign,
-    StreamIntrinsic, Tuple, Type, TypeDefKind, TypeId, TypeOwner, Variant, WasmExport,
-    WasmExportKind, WasmImport, WorldId, WorldKey,
+    InterfaceId, LiftLowerAbi, Mangling, ManglingAndAbi, Record, Resolve, ResourceIntrinsic,
+    Result_, SizeAlign, StreamIntrinsic, Tuple, Type, TypeDefKind, TypeId, TypeOwner, Variant,
+    WasmExport, WasmExportKind, WasmImport, WorldId, WorldKey,
 };
 use wit_bindgen_core::{
     AsyncFilterSet, Direction, Files, InterfaceGenerator as CoreInterfaceGenerator, WorldGenerator,
@@ -1657,7 +1657,7 @@ impl<'a> InterfaceGenerator<'a> {
             LiftLower::LiftArgsLowerResults,
             String::new(),
         );
-        bindgen.local_prefix = "p";
+        bindgen.local_prefix = "__p";
         bindgen.skip_endpoint_drops = true;
         abi::deallocate_lists_and_own_in_types(
             bindgen.iface_gen.resolve,
@@ -1702,7 +1702,7 @@ impl<'a> InterfaceGenerator<'a> {
         );
         // Distinct local prefix: these lines are spliced into the wrapper body,
         // which numbers its own locals from `v0`.
-        bindgen.local_prefix = "d";
+        bindgen.local_prefix = "__d";
         abi::deallocate_lists_and_own_in_types(
             bindgen.iface_gen.resolve,
             &types,
@@ -2563,20 +2563,60 @@ impl<'a> CoreInterfaceGenerator<'a> for InterfaceGenerator<'a> {
                 });
                 self.stub_types.insert(cls.clone());
 
-                // The handle table + new/drop wrappers, inlined in the same file
-                // so they have direct access to the class:
+                // The instance table plus the canonical resource intrinsics,
+                // inlined in the same file so they have direct access to the
+                // class.
+                //
+                // The guest owns a *rep* (an integer of its choosing) for each
+                // live instance; the component-model handle is minted by
+                // `[resource-new]` and resolved back with `[resource-rep]`.
+                // Returning a raw table index as if it were a handle traps the
+                // host with "unknown handle index".
                 let safe = sanitize_extern_local(&cls);
+                let intrinsic = |g: &Self, which: ResourceIntrinsic| {
+                    g.resolve.wasm_import_name(
+                        ManglingAndAbi::Legacy(LiftLowerAbi::Sync),
+                        WasmImport::ResourceIntrinsic {
+                            resource: id,
+                            interface: g.interface_key.as_ref(),
+                            intrinsic: which,
+                        },
+                    )
+                };
+                let (new_module, new_name) = intrinsic(self, ResourceIntrinsic::ExportedNew);
+                let (rep_module, rep_name) = intrinsic(self, ResourceIntrinsic::ExportedRep);
+                let (drop_module, drop_name) = intrinsic(self, ResourceIntrinsic::ExportedDrop);
+                writeln!(self.src, "@external(\"{new_module}\", \"{new_name}\")").unwrap();
+                writeln!(
+                    self.src,
+                    "declare function __ext_{safe}_new(rep: i32): i32;"
+                )
+                .unwrap();
+                writeln!(self.src, "@external(\"{rep_module}\", \"{rep_name}\")").unwrap();
+                writeln!(
+                    self.src,
+                    "declare function __ext_{safe}_rep(handle: i32): i32;"
+                )
+                .unwrap();
+                writeln!(self.src, "@external(\"{drop_module}\", \"{drop_name}\")").unwrap();
+                writeln!(
+                    self.src,
+                    "declare function __ext_{safe}_drop_own(handle: i32): void;"
+                )
+                .unwrap();
+                writeln!(self.src).unwrap();
+
                 writeln!(
                     self.src,
                     "const __{safe}_table: Map<i32, {cls}> = new Map<i32, {cls}>();"
                 )
                 .unwrap();
+                writeln!(self.src, "let __{safe}_next: i32 = 1;").unwrap();
                 writeln!(
                     self.src,
-                    "const __{safe}_handles: Map<{cls}, i32> = new Map<{cls}, i32>();"
+                    "/// Register `inst` under a fresh rep and mint an owned handle for it."
                 )
                 .unwrap();
-                writeln!(self.src, "let __{safe}_next: i32 = 1;").unwrap();
                 writeln!(
                     self.src,
                     "export function __{safe}_take(inst: {cls}): i32 {{"
@@ -2584,30 +2624,50 @@ impl<'a> CoreInterfaceGenerator<'a> for InterfaceGenerator<'a> {
                 .unwrap();
                 writeln!(
                     self.src,
-                    "  const h = __{safe}_next++; __{safe}_table.set(h, inst); __{safe}_handles.set(inst, h); return h;"
-                )
-                .unwrap();
-                writeln!(self.src, "}}").unwrap();
-                writeln!(self.src, "export function __{safe}_get(h: i32): {cls} {{ return __{safe}_table.get(h)!; }}").unwrap();
-                writeln!(self.src, "export function __{safe}_drop(h: i32): void {{").unwrap();
-                writeln!(self.src, "  const inst = __{safe}_table.get(h);").unwrap();
-                writeln!(
-                    self.src,
-                    "  if (inst !== null) {{ inst.__onDrop(); __{safe}_table.delete(h); __{safe}_handles.delete(inst); }}"
+                    "  const rep = __{safe}_next++; __{safe}_table.set(rep, inst); return __ext_{safe}_new(rep);"
                 )
                 .unwrap();
                 writeln!(self.src, "}}").unwrap();
                 writeln!(
                     self.src,
-                    "export function __{safe}_drop_instance(inst: {cls}): void {{"
+                    "/// Resolve a rep. A `borrow<{resource_name}>` arrives as the rep itself,"
                 )
                 .unwrap();
                 writeln!(
                     self.src,
-                    "  const h = __{safe}_handles.get(inst); if (h !== null) __{safe}_drop(h);"
+                    "/// because the borrow is lifted inside the component that owns it."
+                )
+                .unwrap();
+                writeln!(self.src, "export function __{safe}_get(rep: i32): {cls} {{ return __{safe}_table.get(rep)!; }}").unwrap();
+                writeln!(
+                    self.src,
+                    "/// Resolve an owned handle, which does need a table lookup on the host."
+                )
+                .unwrap();
+                writeln!(self.src, "export function __{safe}_get_own(handle: i32): {cls} {{ return __{safe}_table.get(__ext_{safe}_rep(handle))!; }}").unwrap();
+                writeln!(
+                    self.src,
+                    "/// Canonical destructor body. The host passes the rep, not a handle."
+                )
+                .unwrap();
+                writeln!(self.src, "export function __{safe}_drop(rep: i32): void {{").unwrap();
+                writeln!(self.src, "  const inst = __{safe}_table.get(rep);").unwrap();
+                writeln!(
+                    self.src,
+                    "  if (inst !== null) {{ inst.__onDrop(); __{safe}_table.delete(rep); }}"
                 )
                 .unwrap();
                 writeln!(self.src, "}}").unwrap();
+                writeln!(
+                    self.src,
+                    "/// Consume an owned handle. The host calls the destructor in turn."
+                )
+                .unwrap();
+                writeln!(
+                    self.src,
+                    "export function __{safe}_drop_own(handle: i32): void {{ __ext_{safe}_drop_own(handle); }}"
+                )
+                .unwrap();
                 writeln!(self.src).unwrap();
 
                 // Register the canonical wasm-export `[dtor]<resource>` wrapper.
@@ -2864,8 +2924,12 @@ struct FunctionBindgen<'a, 'b> {
     call_target: String,
     /// Counter for fresh local-variable names.
     next_local: u32,
-    /// Prefix for fresh local names. Bodies generated separately and spliced
-    /// into another body need their own prefix to avoid redeclaration.
+    /// Prefix for fresh local names. Always starts with `__`, which no WIT
+    /// identifier can produce, so a generated local can never shadow a
+    /// parameter: a function taking a parameter literally named `v1` used to
+    /// have its arguments silently swapped. Bodies generated separately and
+    /// spliced into another body use a different prefix so their declarations
+    /// do not collide either.
     local_prefix: &'static str,
     /// Lines emitted straight after `CallInterface` on the synchronous export
     /// path — parameter cleanup, which must run after the user call but before
@@ -2877,6 +2941,9 @@ struct FunctionBindgen<'a, 'b> {
     /// Number of raw wasm arguments an async export persists on its task so
     /// the finish helper can release them.
     async_export_arg_count: usize,
+    /// Lifted exported-resource instances mapped to the raw handle they came
+    /// from, so an owned handle can be released with `[resource-drop]`.
+    lifted_handles: HashMap<String, String>,
     /// Suppress `DropHandle` for future/stream endpoints.
     ///
     /// An async export's task drives its endpoints across suspensions and drops
@@ -2911,10 +2978,11 @@ impl<'a, 'b> FunctionBindgen<'a, 'b> {
             lift_lower,
             call_target,
             next_local: 0,
-            local_prefix: "v",
+            local_prefix: "__v",
             after_call: String::new(),
             after_wasm_call: String::new(),
             async_export_arg_count: 0,
+            lifted_handles: HashMap::new(),
             skip_endpoint_drops: false,
             next_endpoint: 0,
             src: String::new(),
@@ -3461,7 +3529,24 @@ impl<'a, 'b> Bindgen for FunctionBindgen<'a, 'b> {
                     let ty = &self.iface_gen.resolve.types[res_id];
                     let res_name = ty.name.clone().unwrap_or_default();
                     let safe = sanitize_extern_local(&ident::type_name(&res_name));
-                    results.push(format!("{prefix}__{safe}_get({})", operands[0]));
+                    // Bind the incoming value: an owned handle has to be
+                    // dropped through `[resource-drop]`, and the instance alone
+                    // cannot name it.
+                    let raw = self.fresh();
+                    let inst = self.fresh();
+                    self.push_line(&format!("const {raw} = {};", operands[0]));
+                    match handle {
+                        Handle::Own(_) => {
+                            self.push_line(&format!(
+                                "const {inst} = {prefix}__{safe}_get_own({raw});"
+                            ));
+                            self.lifted_handles.insert(inst.clone(), raw);
+                        }
+                        Handle::Borrow(_) => {
+                            self.push_line(&format!("const {inst} = {prefix}__{safe}_get({raw});"));
+                        }
+                    }
+                    results.push(inst);
                 } else {
                     let cls = self.iface_gen.named_type_ref(res_id);
                     results.push(format!("new {cls}({})", operands[0]));
@@ -3782,16 +3867,21 @@ impl<'a, 'b> Bindgen for FunctionBindgen<'a, 'b> {
                 for i in 0..*size {
                     let base = self.fresh();
                     let elem = self.fresh();
+                    // The same block source is replayed for every element, so
+                    // each replay needs its own scope or its `const`
+                    // declarations collide.
+                    self.push_line("{");
                     self.push_line(&format!(
-                        "const {base}: usize = {addr} + <usize>({i} * {elem_size});"
+                        "  const {base}: usize = {addr} + <usize>({i} * {elem_size});"
                     ));
-                    self.push_line(&format!("const {elem} = {arr}[{i}];"));
+                    self.push_line(&format!("  const {elem} = {arr}[{i}];"));
                     for line in block_src.lines() {
                         let l = line
                             .replace("__ITER_BASE__", &base)
                             .replace("__ITER_ELEM__", &elem);
-                        self.push_line(&l);
+                        self.push_line(&format!("  {l}"));
                     }
+                    self.push_line("}");
                 }
             }
             Instruction::FixedLengthListLiftFromMemory { size, element, .. } => {
@@ -3807,17 +3897,22 @@ impl<'a, 'b> Bindgen for FunctionBindgen<'a, 'b> {
                     .expect("FixedLengthListLiftFromMemory expects a block");
                 for i in 0..*size {
                     let base = self.fresh();
+                    // Scoped for the same reason as
+                    // `FixedLengthListLowerToMemory`: one block source, many
+                    // replays.
+                    self.push_line("{");
                     self.push_line(&format!(
-                        "const {base}: usize = {addr} + <usize>({i} * {elem_size});"
+                        "  const {base}: usize = {addr} + <usize>({i} * {elem_size});"
                     ));
                     for line in block_src.lines() {
                         let l = line.replace("__ITER_BASE__", &base);
-                        self.push_line(&l);
+                        self.push_line(&format!("  {l}"));
                     }
                     if let Some(r) = block_results.first() {
                         let r = r.replace("__ITER_BASE__", &base);
-                        self.push_line(&format!("{arr}[{i}] = {r};"));
+                        self.push_line(&format!("  {arr}[{i}] = {r};"));
                     }
+                    self.push_line("}");
                 }
                 results.push(arr);
             }
@@ -4065,10 +4160,15 @@ impl<'a, 'b> Bindgen for FunctionBindgen<'a, 'b> {
                                     .as_deref()
                                     .unwrap_or_default(),
                             ));
-                            self.push_line(&format!(
-                                "{prefix}__{safe}_drop_instance({});",
-                                operands[0]
-                            ));
+                            // `abi::deallocate` always lifts before dropping,
+                            // so the raw handle behind this instance is the one
+                            // `HandleLift` bound a moment ago.
+                            let handle = self
+                                .lifted_handles
+                                .get(&operands[0])
+                                .expect("owned exported-resource drop without a lifted handle")
+                                .clone();
+                            self.push_line(&format!("{prefix}__{safe}_drop_own({handle});"));
                         } else {
                             self.push_line(&format!("{}.drop();", operands[0]));
                         }
@@ -4487,7 +4587,7 @@ mod tests {
             .find("ffi.cabi_realloc(a0, <usize>(a1 << 1), 2, 0);")
             .expect("string parameter buffer is freed");
         let free_list = glue
-            .find("ffi.cabi_realloc(d0, <usize>(d1 * 4), 4, 0);")
+            .find("ffi.cabi_realloc(__d0, <usize>(__d1 * 4), 4, 0);")
             .expect("list parameter buffer is freed");
         assert!(
             call < free_string && call < free_list,
@@ -4526,14 +4626,14 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split("\n}").next())
             .expect("sync numeric-list import");
-        assert!(nums.contains("changetype<usize>(v0.dataStart)"));
+        assert!(nums.contains("changetype<usize>(__v0.dataStart)"));
         assert!(!nums.contains("u32ArrayLower"));
 
         // Non-canonical list: the lowered buffer and each element's string
         // buffer are released, and only after the call.
         let call = imports.find("__ext_strs(").expect("import call");
         let free_elems = imports
-            .find("ffi.cabi_realloc(load<usize>(v7 + 0), <usize>(load<usize>(v7 + 4) << 1), 2, 0);")
+            .find("ffi.cabi_realloc(load<usize>(__v7 + 0), <usize>(load<usize>(__v7 + 4) << 1), 2, 0);")
             .expect("element string buffers freed");
         assert!(call < free_elems);
 
@@ -4595,6 +4695,112 @@ mod tests {
             "test-world",
             Opts::default(),
         );
+    }
+
+    /// Fixed-length lists are unrolled: the same block source is replayed once
+    /// per element. Any `const` the block declares was therefore emitted N
+    /// times into one scope, which `asc` rejects with "Cannot redeclare
+    /// block-scoped variable". Only nested fixed-length lists (and records
+    /// containing them) declare block locals, which is why the flat cases in
+    /// `tests/codegen` never caught it.
+    #[test]
+    fn unrolled_fixed_length_list_elements_get_their_own_scope() {
+        let files = generate(
+            r#"
+                package test:bindings;
+
+                interface api {
+                    roundtrip: func(a: list<list<u32, 2>, 2>) -> list<list<u32, 2>, 2>;
+                }
+
+                world test-world {
+                    export api;
+                }
+            "#,
+            "test-world",
+            Opts::default(),
+        );
+        let glue = file(&files, "exports/test$bindings$api.ts");
+
+        let body = glue
+            .split("export function __exp_0_roundtrip")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("export wrapper");
+        // Walk the wrapper the way `asc` does: a `const` may not shadow a name
+        // that is already visible in an enclosing scope.
+        let mut scopes: Vec<Vec<String>> = vec![Vec::new()];
+        let mut clashes: Vec<String> = Vec::new();
+        for line in body.lines() {
+            let line = line.trim();
+            match line {
+                "{" => scopes.push(Vec::new()),
+                "}" => {
+                    scopes.pop();
+                }
+                _ => {
+                    if let Some(rest) = line.strip_prefix("const ") {
+                        let name = rest
+                            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                            .next()
+                            .unwrap()
+                            .to_string();
+                        if scopes.iter().any(|scope| scope.contains(&name)) {
+                            clashes.push(name.clone());
+                        }
+                        scopes.last_mut().unwrap().push(name);
+                    }
+                }
+            }
+        }
+        assert!(
+            clashes.is_empty(),
+            "locals redeclared in a visible scope: {clashes:?}\n{body}"
+        );
+        // Guard against the scoping being dropped and this passing only because
+        // the replays happened to use distinct names.
+        assert!(
+            body.lines().any(|line| line.trim() == "{"),
+            "replayed blocks must be scoped"
+        );
+    }
+
+    /// Generated locals used to be `v0`, `v1`, ... — the same shape a WIT
+    /// parameter can have. `foo(v1: ..., v2: ...)` had `const v1 = <second
+    /// argument>` shadow the parameter, so later reads of `v1` silently picked
+    /// up the wrong value and the arguments were swapped.
+    #[test]
+    fn generated_locals_cannot_shadow_a_parameter() {
+        let files = generate(
+            r#"
+                package test:bindings;
+
+                interface api {
+                    record r { a: u32 }
+                    foo: func(v0: r, v1: r, v2: r) -> u32;
+                }
+
+                world test-world {
+                    import api;
+                }
+            "#,
+            "test-world",
+            Opts::default(),
+        );
+        let imports = file(&files, "imports/test$bindings$api.ts");
+        let body = imports
+            .split("export function foo(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("import call");
+
+        for name in ["v0", "v1", "v2"] {
+            assert!(
+                !body.contains(&format!("const {name} =")),
+                "generated local `{name}` shadows the parameter of the same name:\n{body}"
+            );
+        }
+        assert!(body.contains("const __v0 ="));
     }
 
     #[test]
@@ -4976,9 +5182,11 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        // The exported instance table is emitted for the resource.
-        assert!(generated.contains("Map<Item, i32>"));
-        assert!(generated.contains("export function __Item_drop_instance("));
+        // The exported instance table is emitted for the resource, keyed by
+        // the rep the guest hands to `[resource-new]`.
+        assert!(generated.contains("Map<i32, Item>"));
+        assert!(generated.contains("export function __Item_take(inst: Item): i32 {"));
+        assert!(generated.contains("export function __Item_drop_own(handle: i32): void"));
         // Owned params are released exactly once, only on the cancelled path,
         // and the operand is the already-lifted wrapper (not re-wrapped).
         assert!(generated.contains("private releaseParams(own: bool): void {"));
@@ -5066,10 +5274,11 @@ mod tests {
         // The raw arguments are persisted on the task...
         assert!(glue.contains("__arg0: i32 = 0;"));
         assert!(glue.contains("__arg1: usize = 0;"));
-        assert!(glue.contains("v0.__arg0 = a0;"));
+        assert!(glue.contains("__v2.__arg0 = a0;"));
         // ...and read back by the finish helper, before the task is freed.
+        assert!(glue.contains("const __p0 = load<i32>(task + offsetof<ConsumeTask>(\"__arg0\"));"));
         let drop_handle = glue
-            .find("__Item_drop_instance(__Item_get(load<i32>(task + offsetof<ConsumeTask>(\"__arg0\"))));")
+            .find("__Item_drop_own(__p0);")
             .expect("owned handle released from the finish helper");
         let free_string = glue
             .find("ffi.cabi_realloc(load<usize>(task + offsetof<ConsumeTask>(\"__arg1\"))")
