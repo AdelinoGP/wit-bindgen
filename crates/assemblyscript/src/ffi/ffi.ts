@@ -34,9 +34,14 @@ export function abort(
 export function cabi_realloc(
   ptr: usize,
   _oldSize: usize,
-  _align: u32,
+  align: u32,
   newSize: usize,
 ): usize {
+  // AssemblyScript's TLSF allocator hands back 16-byte-aligned blocks, which
+  // covers every alignment the canonical ABI asks for today (8 at most). There
+  // is no aligned-allocation entry point to fall back on, so assert rather than
+  // silently returning a mis-aligned block if that ever stops being true.
+  assert(align <= 16);
   if (newSize == 0) {
     if (ptr != 0) heap.free(ptr);
     return 0;
@@ -64,8 +69,17 @@ export function strLift(ptr: usize, codeUnitLen: usize): string {
 // allocated via cabi_realloc; the buffer is owned by the receiver.
 // ---------------------------------------------------------------------------
 
+// The canonical ABI hands lengths over as u32, but AssemblyScript's typed
+// array constructors take i32: a length at or above 2^31 would arrive as a
+// negative size. Trap on it instead of constructing a bogus array.
+@inline
+function checkedLen(len: u32): i32 {
+  assert(len <= <u32>i32.MAX_VALUE);
+  return <i32>len;
+}
+
 export function u8ArrayLift(ptr: usize, len: u32): Uint8Array {
-  const out = new Uint8Array(<i32>len);
+  const out = new Uint8Array(checkedLen(len));
   memory.copy(out.dataStart, ptr, <usize>len);
   return out;
 }
@@ -79,7 +93,7 @@ export function u8ArrayLower(arr: Uint8Array): usize {
 }
 
 export function i8ArrayLift(ptr: usize, len: u32): Int8Array {
-  const out = new Int8Array(<i32>len);
+  const out = new Int8Array(checkedLen(len));
   memory.copy(out.dataStart, ptr, <usize>len);
   return out;
 }
@@ -93,7 +107,7 @@ export function i8ArrayLower(arr: Int8Array): usize {
 }
 
 export function u16ArrayLift(ptr: usize, len: u32): Uint16Array {
-  const out = new Uint16Array(<i32>len);
+  const out = new Uint16Array(checkedLen(len));
   memory.copy(out.dataStart, ptr, (<usize>len) << 1);
   return out;
 }
@@ -107,7 +121,7 @@ export function u16ArrayLower(arr: Uint16Array): usize {
 }
 
 export function i16ArrayLift(ptr: usize, len: u32): Int16Array {
-  const out = new Int16Array(<i32>len);
+  const out = new Int16Array(checkedLen(len));
   memory.copy(out.dataStart, ptr, (<usize>len) << 1);
   return out;
 }
@@ -121,7 +135,7 @@ export function i16ArrayLower(arr: Int16Array): usize {
 }
 
 export function u32ArrayLift(ptr: usize, len: u32): Uint32Array {
-  const out = new Uint32Array(<i32>len);
+  const out = new Uint32Array(checkedLen(len));
   memory.copy(out.dataStart, ptr, (<usize>len) << 2);
   return out;
 }
@@ -135,7 +149,7 @@ export function u32ArrayLower(arr: Uint32Array): usize {
 }
 
 export function i32ArrayLift(ptr: usize, len: u32): Int32Array {
-  const out = new Int32Array(<i32>len);
+  const out = new Int32Array(checkedLen(len));
   memory.copy(out.dataStart, ptr, (<usize>len) << 2);
   return out;
 }
@@ -149,7 +163,7 @@ export function i32ArrayLower(arr: Int32Array): usize {
 }
 
 export function u64ArrayLift(ptr: usize, len: u32): Uint64Array {
-  const out = new Uint64Array(<i32>len);
+  const out = new Uint64Array(checkedLen(len));
   memory.copy(out.dataStart, ptr, (<usize>len) << 3);
   return out;
 }
@@ -163,7 +177,7 @@ export function u64ArrayLower(arr: Uint64Array): usize {
 }
 
 export function i64ArrayLift(ptr: usize, len: u32): Int64Array {
-  const out = new Int64Array(<i32>len);
+  const out = new Int64Array(checkedLen(len));
   memory.copy(out.dataStart, ptr, (<usize>len) << 3);
   return out;
 }
@@ -177,7 +191,7 @@ export function i64ArrayLower(arr: Int64Array): usize {
 }
 
 export function f32ArrayLift(ptr: usize, len: u32): Float32Array {
-  const out = new Float32Array(<i32>len);
+  const out = new Float32Array(checkedLen(len));
   memory.copy(out.dataStart, ptr, (<usize>len) << 2);
   return out;
 }
@@ -191,7 +205,7 @@ export function f32ArrayLower(arr: Float32Array): usize {
 }
 
 export function f64ArrayLift(ptr: usize, len: u32): Float64Array {
-  const out = new Float64Array(<i32>len);
+  const out = new Float64Array(checkedLen(len));
   memory.copy(out.dataStart, ptr, (<usize>len) << 3);
   return out;
 }

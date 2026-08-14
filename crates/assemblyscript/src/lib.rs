@@ -12,12 +12,21 @@
 //! locals **before** taking raw pointers, and keeps them live through the
 //! enclosing wasm-import call. No explicit `__pin` / `__unpin` is emitted.
 //!
+//! # Output layout
+//!
+//! Each exported interface is emitted as two files. `exports/<basename>.ts`
+//! (or `world.ts` for world-level exports) holds generated glue only — types,
+//! wasm-export wrappers, async task bases, callbacks, and endpoint
+//! declarations — and is always regenerated. `stubs/<basename>.ts` holds the
+//! user's implementation: the exported resource classes and the entrypoint
+//! each export dispatches to. `--ignore-stub` preserves the latter only.
+//!
 //! # Async
 //!
 //! Async callback bindings use an explicit stackless `AsyncTask` API because
-//! AssemblyScript has no native async/await. `future<T>`, `stream<T>`, and
-//! `future<T>` and `stream<T>` remain opaque handles, with raw endpoint helpers
-//! exposing canonical payload pointers for explicit lifting and lowering.
+//! AssemblyScript has no native async/await. `future<T>` and `stream<T>`
+//! remain opaque handles, with raw endpoint helpers exposing canonical payload
+//! pointers for explicit lifting and lowering.
 
 use anyhow::Result;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1434,8 +1443,18 @@ impl<'a> InterfaceGenerator<'a> {
         };
         let sig = self.func_signature(func, variant);
 
+        // An async export owns its parameters for the whole life of its task,
+        // so their release is driven from the finish helper rather than from
+        // the wrapper. Compute it up front: the task base has to carry the raw
+        // arguments as fields for the finish helper to read back.
+        let async_params = if is_async {
+            self.async_export_param_cleanup(func, &user_ident)
+        } else {
+            None
+        };
+
         if is_async {
-            self.emit_async_task_base(func, &user_ident, &sig);
+            self.emit_async_task_base(func, &user_ident, &sig, async_params.as_ref());
         }
 
         // The user-facing entrypoint goes to `stubs/<basename>.ts`; the glue
@@ -1500,6 +1519,7 @@ impl<'a> InterfaceGenerator<'a> {
         let mut wrapper_body = String::new();
 
         if is_async {
+            let arg_count = async_params.as_ref().map(|p| p.0.len()).unwrap_or(0);
             let mut bindgen = FunctionBindgen::new(
                 self,
                 func,
@@ -1507,6 +1527,7 @@ impl<'a> InterfaceGenerator<'a> {
                 LiftLower::LiftArgsLowerResults,
                 user_ident.clone(),
             );
+            bindgen.async_export_arg_count = arg_count;
             abi::call(
                 bindgen.iface_gen.resolve,
                 variant,
@@ -1585,10 +1606,71 @@ impl<'a> InterfaceGenerator<'a> {
         });
 
         if is_async {
-            self.emit_async_export_support(func, &func_local, &user_ident);
+            self.emit_async_export_support(
+                func,
+                &func_local,
+                &user_ident,
+                async_params.as_ref().map(|p| p.1.as_str()).unwrap_or(""),
+            );
         } else {
             self.emit_post_return(func, &func_local);
         }
+    }
+
+    /// Release what the caller transferred with an *async* export's parameters.
+    ///
+    /// Unlike a synchronous export, the task outlives the wrapper, so this runs
+    /// from the finish helper on the way out — on both the returned and the
+    /// cancelled path. Returns the raw wasm types the task base has to persist
+    /// as `__arg<i>` fields, plus the cleanup body, or `None` when the
+    /// parameters own nothing.
+    fn async_export_param_cleanup(
+        &mut self,
+        func: &Function,
+        user_ident: &str,
+    ) -> Option<(Vec<WasmType>, String)> {
+        let types: Vec<Type> = func.params.iter().map(|p| p.ty).collect();
+        if types.is_empty() {
+            return None;
+        }
+        let task_type = format!("{}Task", ident::type_name(user_ident));
+        let wasm_sig = self
+            .resolve
+            .wasm_signature(AbiVariant::GuestExportAsync, func);
+        let arg_types = wasm_sig.params.clone();
+        let load = |i: usize| {
+            format!(
+                "load<{}>(task + offsetof<{task_type}>(\"__arg{i}\"))",
+                wasm_type_name(arg_types[i])
+            )
+        };
+        let operands: Vec<String> = if wasm_sig.indirect_params {
+            vec![load(0)]
+        } else {
+            (0..arg_types.len()).map(load).collect()
+        };
+
+        let mut bindgen = FunctionBindgen::new(
+            self,
+            func,
+            AbiVariant::GuestExportAsync,
+            LiftLower::LiftArgsLowerResults,
+            String::new(),
+        );
+        bindgen.local_prefix = "p";
+        bindgen.skip_endpoint_drops = true;
+        abi::deallocate_lists_and_own_in_types(
+            bindgen.iface_gen.resolve,
+            &types,
+            &operands,
+            wasm_sig.indirect_params,
+            &mut bindgen,
+        );
+        let body = bindgen.into_body();
+        if body.trim().is_empty() {
+            return None;
+        }
+        Some((arg_types, body))
     }
 
     /// Release what the caller transferred with a synchronous export's
@@ -1686,7 +1768,13 @@ impl<'a> InterfaceGenerator<'a> {
         });
     }
 
-    fn emit_async_task_base(&mut self, func: &Function, func_local: &str, sig: &FuncSig) {
+    fn emit_async_task_base(
+        &mut self,
+        func: &Function,
+        func_local: &str,
+        sig: &FuncSig,
+        async_params: Option<&(Vec<WasmType>, String)>,
+    ) {
         let task_type = format!("{}Task", ident::type_name(func_local));
         let (_, _, task_return_sig) =
             func.task_return_import(self.resolve, self.interface_key.as_ref(), Mangling::Legacy);
@@ -1705,6 +1793,17 @@ impl<'a> InterfaceGenerator<'a> {
         writeln!(self.src, "    return async_.CALLBACK_CODE_EXIT;").unwrap();
         writeln!(self.src, "  }}").unwrap();
         writeln!(self.src, "  finished: bool = false;").unwrap();
+        if let Some((arg_types, _)) = async_params {
+            writeln!(
+                self.src,
+                "  // Raw arguments, kept so the finish helper can release what"
+            )
+            .unwrap();
+            writeln!(self.src, "  // the caller transferred with them.").unwrap();
+            for (i, ty) in arg_types.iter().enumerate() {
+                writeln!(self.src, "  __arg{i}: {} = 0;", wasm_type_name(*ty)).unwrap();
+            }
+        }
         self.emit_typed_future_helpers(func);
         for (i, ty) in task_return_types.iter().enumerate() {
             writeln!(self.src, "  return{i}: {} = 0;", wasm_type_name(*ty)).unwrap();
@@ -1910,7 +2009,13 @@ impl<'a> InterfaceGenerator<'a> {
         }
     }
 
-    fn emit_async_export_support(&mut self, func: &Function, func_local: &str, user_ident: &str) {
+    fn emit_async_export_support(
+        &mut self,
+        func: &Function,
+        func_local: &str,
+        user_ident: &str,
+        param_cleanup: &str,
+    ) {
         let safe = sanitize_extern_local(&format!(
             "{}_{}",
             self.interface.map(|id| id.index()).unwrap_or(usize::MAX),
@@ -1974,6 +2079,11 @@ impl<'a> InterfaceGenerator<'a> {
         writeln!(self.src, "  }} else {{").unwrap();
         writeln!(self.src, "    unreachable();").unwrap();
         writeln!(self.src, "  }}").unwrap();
+        // The task owned its parameters for its whole life; release them on the
+        // way out, whichever way it exited, while the task is still allocated.
+        for line in param_cleanup.lines() {
+            writeln!(self.src, "  {line}").unwrap();
+        }
         // Clear context-0 before freeing the task so `complete` never inspects
         // a freed allocation.
         writeln!(self.src, "  async_.Scheduler.complete(task);").unwrap();
@@ -2764,6 +2874,16 @@ struct FunctionBindgen<'a, 'b> {
     /// Lines emitted straight after `CallWasm` — release of buffers a
     /// synchronous import only borrowed.
     after_wasm_call: String,
+    /// Number of raw wasm arguments an async export persists on its task so
+    /// the finish helper can release them.
+    async_export_arg_count: usize,
+    /// Suppress `DropHandle` for future/stream endpoints.
+    ///
+    /// An async export's task drives its endpoints across suspensions and drops
+    /// them itself, exactly as `test.c` does; releasing them again when the
+    /// task exits would double-drop. Owned resources, lists, strings, and error
+    /// contexts are still released.
+    skip_endpoint_drops: bool,
     /// Next future/stream occurrence in the function's canonical endpoint order.
     next_endpoint: usize,
     /// Output source written into the current block. Blocks accumulate into
@@ -2794,6 +2914,8 @@ impl<'a, 'b> FunctionBindgen<'a, 'b> {
             local_prefix: "v",
             after_call: String::new(),
             after_wasm_call: String::new(),
+            async_export_arg_count: 0,
+            skip_endpoint_drops: false,
             next_endpoint: 0,
             src: String::new(),
             blocks: Vec::new(),
@@ -3799,6 +3921,9 @@ impl<'a, 'b> Bindgen for FunctionBindgen<'a, 'b> {
                 if *async_ {
                     let task = self.fresh();
                     self.push_line(&format!("const {task} = {}({args});", self.call_target));
+                    for i in 0..self.async_export_arg_count {
+                        self.push_line(&format!("{task}.__arg{i} = a{i};"));
+                    }
                     self.push_line(&format!("return async_.Scheduler.start({task});"));
                     if let Some(result) = &func.result {
                         let ty = self.iface_gen.type_ref(result);
@@ -3963,6 +4088,9 @@ impl<'a, 'b> Bindgen for FunctionBindgen<'a, 'b> {
                         return;
                     }
                 };
+                if self.skip_endpoint_drops {
+                    return;
+                }
                 let endpoints = self.func.find_futures_and_streams(self.iface_gen.resolve);
                 let index = endpoints
                     .iter()
@@ -4414,6 +4542,61 @@ mod tests {
         assert!(imports.contains("ffi.u32ArrayLower("));
     }
 
+    /// Two hard limits of the backend, pinned so that raising them (or turning
+    /// them into a graceful error) is a deliberate change rather than a
+    /// surprise in the field. `ffi.ts` defines `Tuple1`..`Tuple16`, and
+    /// AssemblyScript has no integer wider than 64 bits to hold a flags value.
+    #[test]
+    #[should_panic(expected = "arity 17 > 16")]
+    fn tuples_wider_than_sixteen_are_rejected() {
+        let types = (0..17)
+            .map(|i| format!("t{i}: u8"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        generate(
+            &format!(
+                r#"
+                package test:bindings;
+
+                world test-world {{
+                    export wide: func() -> tuple<{}>;
+                }}
+                "#,
+                vec!["u8"; 17].join(", ")
+            )
+            .replace("UNUSED", &types),
+            "test-world",
+            Opts::default(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "flag count > 64")]
+    fn flags_wider_than_sixty_four_are_rejected() {
+        let members = (0..65)
+            .map(|i| format!("flag{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        generate(
+            &format!(
+                r#"
+                package test:bindings;
+
+                interface api {{
+                    flags wide {{ {members} }}
+                    take: func(a: wide);
+                }}
+
+                world test-world {{
+                    export api;
+                }}
+                "#
+            ),
+            "test-world",
+            Opts::default(),
+        );
+    }
+
     #[test]
     fn async_import_drop_helpers_follow_duplicate_endpoint_occurrences() {
         let files = generate(
@@ -4803,14 +4986,18 @@ mod tests {
         assert!(!generated.contains("new i_test$bindings$api.Item(new "));
     }
 
-    /// Documents the gap described on
-    /// `exported_owned_resource_cleanup_uses_instance_table`: the handle for a
-    /// guest-exported resource is currently lowered as a raw `.handle` on an
-    /// imported wrapper rather than acquired with `__Item_take`. When that is
-    /// fixed this test should start failing and be replaced by a positive
-    /// assertion on the instance-table routing.
+    /// A world that exports an interface *and* imports something using that
+    /// interface's resource ends up with two distinct resource types: the
+    /// imported view and the exported one. The import must therefore lower a
+    /// raw handle on the imported wrapper rather than acquire one from the
+    /// exported instance table — `wit-bindgen-rust` splits the same world into
+    /// `test::bindings::api::Item` and `exports::test::bindings::api::Item` for
+    /// exactly this reason.
+    ///
+    /// Previously read as a known gap ("not yet routed through the instance
+    /// table"); it is the correct lowering.
     #[test]
-    fn exported_resource_through_async_import_is_not_yet_routed_through_the_instance_table() {
+    fn imported_and_exported_views_of_a_resource_are_distinct_types() {
         let files = generate(
             r#"
                 package test:bindings;
@@ -4843,12 +5030,54 @@ mod tests {
 
         assert!(
             generated.contains("const subtask = new RunSubtask(value.handle);"),
-            "expected the current raw-handle lowering, got: {generated}"
+            "the imported view lowers its own handle, got: {generated}"
         );
         assert!(
-            !generated.contains("__Item_take(value)"),
-            "instance-table routing landed; replace this test with a positive assertion"
+            generated.contains("export function run(value: i_test$bindings$api.Item)"),
+            "the import takes the imported wrapper, not the exported class"
         );
+    }
+
+    /// A synchronous export releases its owned parameters right after the user
+    /// call, but an async export's task outlives the wrapper, so the release is
+    /// driven from the finish helper — on both the returned and the cancelled
+    /// path. Previously nothing released them and the instance table leaked an
+    /// entry per call.
+    #[test]
+    fn async_export_releases_owned_parameters_when_its_task_exits() {
+        let files = generate(
+            r#"
+                package test:bindings;
+
+                interface api {
+                    resource item;
+                    consume: async func(value: own<item>, note: string);
+                }
+
+                world test-world {
+                    export api;
+                }
+            "#,
+            "test-world",
+            Opts::default(),
+        );
+        let glue = file(&files, "exports/test$bindings$api.ts");
+
+        // The raw arguments are persisted on the task...
+        assert!(glue.contains("__arg0: i32 = 0;"));
+        assert!(glue.contains("__arg1: usize = 0;"));
+        assert!(glue.contains("v0.__arg0 = a0;"));
+        // ...and read back by the finish helper, before the task is freed.
+        let drop_handle = glue
+            .find("__Item_drop_instance(__Item_get(load<i32>(task + offsetof<ConsumeTask>(\"__arg0\"))));")
+            .expect("owned handle released from the finish helper");
+        let free_string = glue
+            .find("ffi.cabi_realloc(load<usize>(task + offsetof<ConsumeTask>(\"__arg1\"))")
+            .expect("string parameter buffer released from the finish helper");
+        let release = glue
+            .find("async_.Scheduler.release(task);")
+            .expect("task freed");
+        assert!(drop_handle < release && free_string < release);
     }
 
     #[test]

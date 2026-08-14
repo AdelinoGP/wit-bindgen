@@ -148,9 +148,19 @@ declare function __error_context_debug_message_utf8(handle: i32, retptr: usize):
 // ---------------------------------------------------------------------------
 
 // Waitable event payload: [waitable, code]. Single-instance buffer; wait/poll
-// results must be consumed before the next call.
+// results must be consumed before the next call, and a nested wait/poll would
+// overwrite an outer one's result.
 const __WAITABLE_PAYLOAD: usize = changetype<usize>(memory.data(8));
 
+// STACKFUL USE ONLY. `wait()` and `poll()` below block inside the guest. A
+// callback-ABI task must never block: it has to return `callbackWait(set)` and
+// let the host re-enter through the `[callback]` export. Generated code
+// therefore never calls these, and neither should an async export task. They
+// exist for guests driving the ABI themselves from a synchronous export.
+//
+// This class is also managed while tasks are `@unmanaged`, so an instance
+// cannot be persisted on a task across a suspension — keep the raw handle from
+// `waitableSetNew()` instead.
 export class WaitableSet {
   waitable: i32 = 0;
   code: i32 = 0;
@@ -251,7 +261,8 @@ export function threadYield(): bool {
 
 // The canonical debug-message operation returns an owned UTF-8 buffer through
 // a pointer/length pair. Keep the return area single-instance, like the other
-// small ABI result buffers in this runtime.
+// small ABI result buffers in this runtime. Not re-entrancy safe: the result
+// must be read before anything else can call `debugMessage`.
 const __ERROR_CONTEXT_RET: usize = changetype<usize>(memory.data(16));
 
 export class ErrorContext {
@@ -391,6 +402,9 @@ export class Scheduler {
     return CALLBACK_CODE_YIELD;
   }
 
+  // Convenience over `callbackWait` for code that already holds a
+  // `WaitableSet`. Returning this is safe under the callback ABI; calling
+  // `set.wait()` is not.
   static wait(set: WaitableSet): i32 {
     return callbackWait(set.handle);
   }
