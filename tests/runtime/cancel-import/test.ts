@@ -90,9 +90,16 @@ export function __callback_0_pendingImport(event: i32, waitable: i32, code: i32)
 function __finishPendingImport(status: i32): void {
   const task = async_.contextGet();
   if (status != async_.CALLBACK_CODE_EXIT || task == 0) return;
-  if (load<bool>(task + offsetof<PendingImportTask>("finished"))) __taskReturn();
-  async_.Scheduler.release(task);
+  // Exactly one of task.return / task.cancel, matching the generated helper.
+  if (load<bool>(task + offsetof<PendingImportTask>("finished"))) {
+    __taskReturn();
+  } else if (async_.Scheduler.wasCancelled()) {
+    async_.taskCancel();
+  } else {
+    unreachable();
+  }
   async_.Scheduler.complete(task);
+  async_.Scheduler.release(task);
 }
 
 export function __exp_0_backpressureSet(a0: i32): void {

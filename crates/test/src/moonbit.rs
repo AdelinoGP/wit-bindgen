@@ -129,7 +129,8 @@ impl LanguageMethods for MoonBit {
         config: &crate::config::WitConfig,
         _args: &[String],
     ) -> bool {
-        name == "named-fixed-length-list.wit-async" || config.error_context
+        let _ = name;
+        config.error_context
     }
 
     fn verify(&self, runner: &Runner, verify: &crate::Verify) -> anyhow::Result<()> {

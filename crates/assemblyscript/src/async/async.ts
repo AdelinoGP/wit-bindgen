@@ -59,7 +59,9 @@ export function subtaskState(status: i32): i32 {
 
 @inline
 export function subtaskHandle(status: i32): i32 {
-  return status >> 4;
+  // The packed handle is unsigned; an arithmetic shift would sign-extend a
+  // handle at or above 2^27 into a negative value.
+  return status >>> 4;
 }
 
 @inline
@@ -69,7 +71,8 @@ export function waitableState(status: i32): i32 {
 
 @inline
 export function waitableCount(status: i32): i32 {
-  return status >> 4;
+  // Unsigned for the same reason as `subtaskHandle`.
+  return status >>> 4;
 }
 
 // ---------------------------------------------------------------------------
@@ -236,8 +239,10 @@ export function contextGet(): usize {
   return __context_get_0();
 }
 
-export function threadYield(): void {
-  __thread_yield();
+// Returns true when the task was cancelled while suspended at this yield
+// point. Discarding the result would make cancellation unobservable here.
+export function threadYield(): bool {
+  return __thread_yield() != 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -265,8 +270,11 @@ export class ErrorContext {
     __error_context_debug_message_utf8(this.handle, __ERROR_CONTEXT_RET);
     const ptr = load<usize>(__ERROR_CONTEXT_RET);
     const len = load<usize>(__ERROR_CONTEXT_RET + sizeof<usize>());
+    // Check the pointer before decoding: a zero pointer with a non-zero length
+    // would otherwise read from address 0.
+    if (ptr == 0) return "";
     const message = len == 0 ? "" : String.UTF8.decodeUnsafe(ptr, len);
-    if (ptr != 0) heap.free(ptr);
+    heap.free(ptr);
     return message;
   }
 
@@ -311,41 +319,18 @@ export class UnimplementedTask extends AsyncTask {
   }
 }
 
-// An async import starts a canonical subtask. The result address remains valid
-// until the caller has observed completion and lifted its result.
-export class AsyncSubtask {
-  status: i32 = 0;
-  state: i32 = STATUS_STARTING;
-  handle: i32 = 0;
-
-  constructor(public result: usize) {}
-
-  start(status: i32): void {
-    this.status = status;
-    this.state = subtaskState(status);
-    this.handle = subtaskHandle(status);
-  }
-
-  join(set: WaitableSet): void {
-    if (this.handle != 0) set.join(this.handle);
-  }
-
-  leave(): void {
-    if (this.handle != 0) __waitable_join(this.handle, 0);
-  }
-
-  cancel(): i32 {
-    return this.handle == 0 ? this.status : subtaskCancel(this.handle);
-  }
-
-  drop(): void {
-    if (this.handle != 0) subtaskDrop(this.handle);
-  }
-}
+// Async import subtasks are emitted per function by the generator as concrete
+// `@unmanaged` classes owning their own status, handle, result area, and
+// lowered parameters. A shared managed subtask class is deliberately absent:
+// it could not be stored in an `@unmanaged` task across a yield.
 
 // Tasks are unmanaged and recovered from the context-0 raw pointer via
 // changetype. The callback ABI carries no task identity beyond this slot, so
 // nested scheduler tasks in the same model task would be ambiguous.
+
+// Set when the in-flight task is delivered EVENT_CANCEL, cleared when it
+// completes. Only one task can occupy context-0 at a time.
+let cancelRequested: bool = false;
 
 export class Scheduler {
   @inline(false)
@@ -362,11 +347,27 @@ export class Scheduler {
   @inline(false)
   static resume(event: i32, waitable: i32, code: i32): i32 {
     const ptr = contextGet();
-    if (ptr == 0) return CALLBACK_CODE_EXIT;
+    // A callback delivered with no task in context-0 means the host and the
+    // guest disagree about task identity; failing loudly beats losing the event.
+    if (ptr == 0) unreachable();
     const task = changetype<AsyncTask>(ptr);
-    if (event == EVENT_CANCEL) taskCancel();
     // Bound AS methods take `this` before their declared arguments.
+    if (event == EVENT_CANCEL) {
+      // The task must observe the cancel so it can release its waitables, but
+      // the canonical ABI requires the callback to return EXIT afterwards and
+      // permits exactly one of task.return / task.cancel. Record the request
+      // and let the generated finish helper issue whichever the task did not.
+      cancelRequested = true;
+      call_indirect<i32>(task.resumeIndex, ptr, event, waitable, code);
+      return CALLBACK_CODE_EXIT;
+    }
     return call_indirect<i32>(task.resumeIndex, ptr, event, waitable, code);
+  }
+
+  // True when the in-flight task was delivered EVENT_CANCEL. Safe as a single
+  // global because `start` rejects a nested task while context-0 is occupied.
+  static wasCancelled(): bool {
+    return cancelRequested;
   }
 
   static current(): AsyncTask {
@@ -380,7 +381,10 @@ export class Scheduler {
   }
 
   static complete(ptr: usize): void {
-    if (contextGet() == ptr) contextSet(0);
+    if (contextGet() == ptr) {
+      contextSet(0);
+      cancelRequested = false;
+    }
   }
 
   static yield(): i32 {

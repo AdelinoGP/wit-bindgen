@@ -4,103 +4,215 @@
 
 Workspace: `D:\wit-bindgen`.
 
-Latest committed changes are `af836ef2` (async ownership cleanup and typed
-error-context support) and `99076ead` (async endpoint alias matching).
-
-This handoff is intentionally uncommitted. Do not reset, clean, or revert the worktree. It contains unrelated concurrent changes and diagnostic artifacts.
+This document was rewritten after an adversarial review of every commit since
+`7942297b`. The previous revision overstated what was validated; the corrections
+are recorded in "Corrected Claims" below. Treat that section as the primary
+result of the review.
 
 ## Objective
 
-Complete the AssemblyScript async backend: executable async exports/imports, future and stream endpoints, error-context support, typed ownership, cancellation, tests, and both AssemblyScript runtimes (`incremental` and `minimal`).
+Complete the AssemblyScript async backend: executable async exports/imports,
+future and stream endpoints, error-context support, typed ownership,
+cancellation, tests, and both AssemblyScript runtimes (`incremental` and
+`minimal`).
 
-## Committed Milestones
+## Blocking Environment Issue
 
-- `af0aa14b`: async callback ABI foundation.
-- `7dbb24c7`: async endpoint task support, raw future/stream helpers, error-context helper scaffolding, generated task bases.
-- `ff87bd87`: executable async yield exports, unmanaged task state, captured-pointer cleanup, and `simple-yield`.
-- `082fb52e`: typed future task helpers for generated async export task bases.
-- `3c702df0`: executable future endpoints and the unmanaged task dispatch fix. The scheduler captures a concrete method thunk/index and resumes via `call_indirect`; virtual dispatch through an unmanaged base is unsafe.
-- `8c84e135`: canonical endpoint cancel names. Only future/stream `read` and `write` use `[async-lower]`; cancel intrinsics do not.
-- `ee13dba4`: executable stream endpoints and `simple-stream`.
-- `284c965d`: per-call unmanaged async-import subtasks with owned scalar result areas; migrated yield/future/stream runners; added `simple-import-params-results`.
-- `e39bbf2e`: typed async-import cancellation, cancellation cleanup, endpoint `DropHandle` cleanup, and `cancel-import` fixtures.
-- `af836ef2`: typed owned `ErrorContext`, exact-once cancellation and
-  reentrancy guards, imported/exported owned-resource cleanup, and regression
-  tests.
-- `99076ead`: async future/stream endpoint cleanup matching across aliases and
-  duplicate occurrences.
+`node`, `npm`, and therefore `asc` are **not available in this environment**.
+They were present earlier in the session (`node v26.2.0`, `npm 11.13.0`) and
+disappeared mid-session: both vfox Node SDK directories
+(`~/.vfox/cache/nodejs/v-26.2.0`, `v-25.8.2`) contain no binaries, and there is
+no system Node install.
 
-## Validated Behavior
+Consequences:
 
-Both AssemblyScript runtimes passed mixed Rust/AssemblyScript matrices for:
+- No AssemblyScript runtime fixture can be built or executed.
+- No AssemblyScript **codegen** test can run either: verification shells out to
+  `asc --noEmit`, and `prepare()` hard-fails when `asc` is missing.
+- The generator changes described below are covered by Rust unit tests that
+  assert on emitted source text. **They have not been type-checked by `asc`.**
 
-- `simple-yield`.
-- `simple-future`.
-- `simple-stream`.
-- `simple-import-params-results`, including concurrent scalar result imports.
-- `cancel-import`, including `STATUS_RETURNED_CANCELLED` and `STATUS_STARTED_CANCELLED`.
+Restore Node/AssemblyScript before trusting any AssemblyScript result.
 
-Representative commands:
+## Corrected Claims
 
-```text
-cargo run test --languages rust,assemblyscript tests/runtime/simple-yield tests/runtime/simple-future tests/runtime/simple-stream tests/runtime/simple-import-params-results --artifacts target/artifacts-as-owned-final --rust-wit-bindgen-path ./crates/guest-rust
-WIT_BINDGEN_AS_RUNTIME=minimal cargo run test --languages rust,assemblyscript tests/runtime/simple-yield tests/runtime/simple-future tests/runtime/simple-stream tests/runtime/simple-import-params-results --artifacts target/artifacts-as-owned-final-minimal --rust-wit-bindgen-path ./crates/guest-rust
-cargo run test --languages rust,assemblyscript tests/runtime/cancel-import --artifacts target/artifacts-cancel-as-final --rust-wit-bindgen-path ./crates/guest-rust
-WIT_BINDGEN_AS_RUNTIME=minimal cargo run test --languages rust,assemblyscript tests/runtime/cancel-import --artifacts target/artifacts-cancel-as-final-minimal --rust-wit-bindgen-path ./crates/guest-rust
-```
+The following statements in the previous handoff were false or unsupported.
 
-Rust checks passed after the committed slices:
+### The runtime fixtures do not test generated async export code
 
-```text
-cargo fmt --check
-cargo test -p wit-bindgen-assemblyscript
-cargo clippy -p wit-bindgen-assemblyscript --all-targets -- -D warnings
-git diff --check
-```
+`crates/test/src/assemblyscript.rs` copies each fixture over the generated file
+named by its `//@ path`. Every async `test.ts` sets
+`path = "exports/<iface>.ts"`, so the fixture **replaces the entire generated
+interface file** — task base, `__exp_*`, `__callback_*`, `__finish___exp_*`, and
+the `@external` endpoint declarations.
 
-Full AssemblyScript codegen passes all `212` tests. Async named fixed-length
-lists now deallocate each flattened element through the shared core ABI.
+The fixtures therefore exercise hand-written replicas of the generator's output,
+not the generator. Two independent confirmations:
 
-## Uncommitted Tracked Changes
+- `tests/runtime/simple-future/test.ts` and `simple-stream/test.ts` hand-declare
+  their own `[future-read-*]`/`[stream-read-*]` intrinsics, bypassing
+  `emit_future_stream_helpers`.
+- Changing the shared runtime's cancellation protocol broke `cancel-import`
+  while every generated-code unit test stayed green, because the fixture carries
+  its own copy of the finish helper.
 
-At handoff, tracked changes are:
+Additionally, every `runner.ts` passes `//@ args = '--async=-run'`, lowering the
+export under test synchronously. **No generated AssemblyScript async export is
+executed by any runtime test.**
 
-- `crates/assemblyscript/src/async/async.ts`.
-- `crates/assemblyscript/src/lib.rs`.
-- `crates/c/README.md`.
-- `crates/c/src/lib.rs`.
+By contrast the Rust fixtures `include!(env!("BINDINGS"))` and implement only the
+trait, so they do exercise generated code.
 
-The C changes are unrelated concurrent work. Do not stage or modify them.
+### AssemblyScript coverage is far narrower than the pass counts suggest
 
-The C changes are unrelated concurrent work. The AssemblyScript changes are:
+6 of 60 `tests/runtime/*` directories contain any `.ts` file. Missing fixtures
+are silently skipped, never failed (`crates/test/src/lib.rs` discovery only hard
+-fails when no runner or no test exists at all, which `runner.rs`/`test.rs`
+satisfy). CI runs `--languages rust,c,assemblyscript tests/runtime` and reports
+green regardless.
 
-- `Type::ErrorContext` now marks the generated world as requiring `async.ts`, while its type representation remains raw `i32`.
-- Generated async-import subtasks have a `cancellationRequested` flag. `cancel()` sets it before calling `[subtask-cancel]` and rejects repeated calls locally; the original handle remains available for the required later `[subtask-drop]`.
-- `Scheduler.start` traps when context-0 is already occupied. Nested scheduler tasks cannot be safely saved/restored because callback arguments carry no task identity.
-- Unit tests `async_import_cancel_is_exactly_once` and `scheduler_rejects_reentrant_tasks` pin the new behavior.
+`tests/runtime/cancel-import/runner.ts` implements 2 of the 5 scenarios that
+`runner.rs` covers; the two cancellation *races* are unimplemented in
+AssemblyScript.
 
-The endpoint occurrence fix, already committed in `e39bbf2e`, is:
+### Several generator unit tests were vacuous
 
-- `FunctionBindgen` has `next_endpoint`.
-- `DropHandle` consumes future/stream occurrences in canonical function order instead of finding the first matching `TypeId`.
-- Async import result cleanup starts its endpoint cursor after parameter occurrences.
-- Unit test `async_import_drop_helpers_follow_duplicate_endpoint_occurrences` checks duplicate parameter endpoints and a later result endpoint.
+- `exported_owned_resource_cleanup_uses_instance_table` asserted substrings that
+  are unconditional per-resource boilerplate; it passed on a world with no async
+  and no owned params.
+- `error_context_uses_typed_wrapper_and_drop` asserted `.handle`, which `async.ts`
+  alone contains 14 times, and never asserted a drop.
+- `async_import_cleanup_drops_imported_owned_resources` asserted `"drop();"`,
+  which matched the malformed double-wrapped form.
 
-The uncommitted AssemblyScript diff passed unit tests, formatting, clippy, focused cancellation matrices under both runtimes, and `git diff --check`. It has not been committed. Do not stage the unrelated C changes.
+These have been strengthened or replaced.
+
+### Worktree/stash claims were stale
+
+The "Uncommitted Tracked Changes" and "Untracked Worktree Content" sections
+described state that no longer existed: the AssemblyScript changes were
+committed, both stashes were gone, and the `return-string` / `error-context`
+experiments had been deleted.
+
+### `ef8c43e3` left the codegen suite red
+
+That commit fixed the shared-ABI `todo!()` for async fixed-length lists but left
+the matching `should_fail_verify` markers in `crates/test/src/rust.rs` and
+`crates/test/src/moonbit.rs`, so `named-fixed-length-list.wit-async` failed with
+"test should have failed, but passed". Both markers are now removed and the
+rust/moonbit/c codegen suite passes (1378 tests).
+
+## Fixed In This Pass
+
+All covered by `cargo test -p wit-bindgen-assemblyscript` (18 tests).
+
+- **Owned-handle cleanup double-wrapped the operand.** `abi::deallocate` lifts an
+  owned handle before emitting `DropHandle`, so the operand is already the
+  wrapper; the backend emitted `new Item(new Item(h)).drop()`, passing the
+  address of a heap wrapper to `[resource-drop]`. `DropHandle` now drops the
+  lifted operand directly.
+- **Variant deallocation emitted nothing.** `GuestDeallocateVariant` popped every
+  payload block and emitted no tag switch, so `option<T>`/`result<_, T>`/`variant`
+  leaked their active payload and never dropped owned handles inside it. It now
+  emits the `switch` over the tag.
+- **List/map deallocation dropped the element block** and passed the element
+  *count* as the buffer's byte size. Both now emit the per-element loop and free
+  `len * elem_size` with the element alignment.
+- **Cancellation could issue two completions.** `Scheduler.resume` called
+  `task.cancel` eagerly on `EVENT_CANCEL` and then resumed the task anyway, so a
+  task that completed during cancellation issued both `task.cancel` and
+  `task.return` and trapped; a task returning YIELD/WAIT from its cancel branch
+  also trapped and leaked. The scheduler now records the cancel, dispatches to
+  the task for cleanup, and forces `EXIT`; the generated finish helper issues
+  whichever of `task.return`/`task.cancel` the task did not, and traps on an exit
+  that is neither.
+- **Use-after-free ordering.** The finish helper freed the task before clearing
+  context-0 (`release` then `complete`); now reversed.
+- **`threadYield()` discarded the cancellation result** from `[thread-yield]`,
+  making cancellation unobservable at yield points. It now returns `bool`.
+- **`ErrorContext.debugMessage` decoded before its null check**, reading address 0
+  when the canonical call returned a zero pointer with a non-zero length.
+- **`subtaskHandle`/`waitableCount` used arithmetic shifts** on unsigned packed
+  fields, sign-extending values at or above 2^27.
+- **Removed the dead managed `AsyncSubtask` class**, which contradicted the
+  `@unmanaged` contract documented in the same file and was superseded by the
+  per-function generated subtask.
+
+`tests/runtime/cancel-import/test.ts` was updated to match the corrected
+cancellation protocol. It could not be executed (see the environment issue).
+
+## Open Bugs
+
+### Exported resources are not routed through the instance table
+
+For a resource the guest exports that is passed out through an imported async
+function, the generator resolves the `use`d resource to an **imported** wrapper
+class and lowers it as a raw `.handle`, instead of acquiring a handle with
+`__Item_take` and releasing it with `__Item_drop_instance`. The exported instance
+table is emitted but never called on this path.
+
+Pinned by `exported_resource_through_async_import_is_not_yet_routed_through_the_instance_table`,
+which asserts the *current* behaviour and is written to fail once this is fixed.
+
+For a plain async **export** taking `own<item>`, no `DropHandle` is emitted at
+all, so the table entry leaks. Owned-handle cleanup only runs on the async import
+path.
+
+### No post-return support
+
+The AssemblyScript backend implements no post-return. `GuestDeallocate*` is
+reachable only through async-import cleanup, so synchronous exports never release
+owned parameters.
+
+### Error contexts are never dropped
+
+No `drop()` is emitted for an owned incoming `error-context`; the generated
+export lifts it and returns `.handle` without releasing it.
+
+### Managed async import results (unchanged, undiagnosed)
+
+Scalar async import results work. Managed results were reported to trap under
+`incremental`. The experiment fixtures no longer exist and could not be recreated
+without Node.
+
+A concrete, untested hypothesis from the review: the generated `{X}Subtask`
+frees itself — `cleanup()` ends with `heap.free(changetype<usize>(this))` while
+`finish()` is still executing and the caller still holds the raw pointer, with
+nothing nulling it. AssemblyScript's TLSF stores free-list links at payload
+offsets 0 and 4, which are exactly the `status` and `state` fields that
+`update()` writes, so post-free writes would corrupt the allocator free list;
+`incremental` would then trap on the next `__new` (which a managed lift performs
+and a scalar path never does) while `minimal` never sweeps. This also explains
+why the recorded workarounds (copying into a `Uint16Array`, removing individual
+cleanup calls) had no effect.
+
+Cheapest falsification: remove the self-`heap.free`, accept the leak, and re-run
+under `incremental`. Requires Node.
+
+### Typed endpoint payloads
+
+Typed future helpers remain export-side only; streams have no typed payload API.
+`tests/runtime/simple-stream-payload/` has no `.ts` fixture.
 
 ## Design Constraints
 
 ### Unmanaged export tasks
 
-Generated/user async export task hierarchies are `@unmanaged`. Persist only scalar fields, raw pointers, handles, booleans, and integer state. Do not persist managed strings, arrays, records, or class references across a yield.
+Generated/user async export task hierarchies are `@unmanaged`. Persist only
+scalar fields, raw pointers, handles, booleans, and integer state. Do not persist
+managed strings, arrays, records, or class references across a yield.
 
-AssemblyScript virtual dispatch reads a managed runtime type header. Calling an overridden method through an unmanaged base is unsafe. The scheduler fix in `3c702df0` captures the concrete method reference/index in `AsyncTask.resumeIndex` at `Scheduler.start` and resumes via `call_indirect`. Preserve this design unless replacing it with explicit concrete per-export dispatch.
+AssemblyScript virtual dispatch reads a managed runtime type header, so calling
+an overridden method through an unmanaged base is unsafe. The scheduler captures
+the concrete method reference in `AsyncTask.resumeIndex` at `Scheduler.start` and
+resumes via `call_indirect`. This is empirically exercised by the fixtures, which
+subclass the generated base and override `resume`.
 
 ### Async-import subtasks
 
-Generated async imports return a per-call `@unmanaged` concrete `*Subtask`, not a raw status. It owns status/state/handle, a result-area pointer, lowered scalar parameters, and lifecycle flags.
-
-Typical use:
+Generated async imports return a per-call `@unmanaged` concrete `*Subtask`
+owning status/state/handle, a result-area pointer, lowered scalar parameters, and
+lifecycle flags.
 
 ```text
 const subtask = imports.someAsync(...);
@@ -108,121 +220,61 @@ const value = subtask.finish(status); // only STATUS_RETURNED
 // or subtask.dispose(status) for cancellation/discarding a result
 ```
 
-`cancel()` invokes canonical `[subtask-cancel]`, updates the object status, and returns the new status. `finish`/`dispose` are intended to be exact-once operations and free the unmanaged subtask after cleanup.
-
 ### Endpoint DropHandle
 
-Core ABI `Instruction::DropHandle` carries only a type, not an explicit endpoint occurrence. The AssemblyScript backend now tracks occurrence order with `next_endpoint`. Preserve the duplicate-type regression test and verify parameter occurrences precede result occurrences.
-
-## Known Gaps
-
-### Managed async import results
-
-Scalar async import results work. Managed result values currently do not have a validated incremental-runtime implementation.
-
-Untracked experiments exist at `tests/runtime/return-string/runner.ts` and `tests/runtime/return-string/test.rs`. They repeatedly import an async string result.
-
-Observed behavior:
-
-- The fixture compiles.
-- Minimal has passed in some runs.
-- Incremental traps in AssemblyScript runtime/GC code.
-- Copying the canonical string into a managed `Uint16Array`/`ArrayBuffer` before decoding did not fix the trap.
-- Removing individual cleanup operations did not remove the trap.
-- The failure is likely managed allocation/lifting after the canonical async call and/or result ownership sequencing, not simply UTF-16 encoding.
-
-Do not commit the return-string fixture or an unvalidated string-lift change. The committed `ffi.strLift` remains the earlier `decodeUnsafe` implementation.
-
-### Error context
-
-Runtime helper scaffolding exists in `crates/assemblyscript/src/async/async.ts`: `ErrorContext.new`, `debugMessage`, `drop`, and raw `errorContextNew`, `errorContextDebugMessage`, and `errorContextDrop` helpers.
-
-Generated WIT `error-context` now maps to `async_.ErrorContext` in
-`crates/assemblyscript/src/lib.rs`. Lowering uses `.handle`, lifting constructs
-`new async_.ErrorContext(handle)`, and owned cleanup calls `.drop()`. Generator
-coverage exists, but no stable runtime coverage exists yet.
-
-The fixture was evaluated after this handoff. Its synchronous WIT form is only an experiment: changing it to async and supplying the required hand-written AssemblyScript task wrappers compiles, but execution under both `incremental` and `minimal` fails with `unknown handle index 1` after enabling both `-Wcomponent-model-async` and `-Wcomponent-model-error-context`. Do not commit the wrapper experiment. The failure confirms that raw handle transfer cannot provide the required ownership semantics.
-
-The paused `tests/runtime/error-context/` experiment compiles but traps during
-execution under both runtime selections, including a synchronous reduction.
-Do not claim runtime support until round-trip, creation, and drop pass under
-both runtimes.
-
-### Typed endpoint payloads
-
-Raw future/stream endpoint helpers and unit future/stream runtime execution work. Generated typed future helpers are export-side only. Streams have no typed payload helper API. No AssemblyScript payload runtime fixture exists.
+Core ABI `Instruction::DropHandle` carries only a type, not an endpoint
+occurrence, so the backend tracks occurrence order with `next_endpoint`. Preserve
+the duplicate-type regression test and verify parameter occurrences precede
+result occurrences.
 
 ### Reentrancy
 
-`Scheduler.start` now rejects a nested start when context-0 is occupied. A save/restore stack is not correct because callback arguments carry no task identity: if both parent and child suspend, either restored pointer can route the next callback to the wrong task. Unit test `scheduler_rejects_reentrant_tasks` pins the runtime guard. No end-to-end trap fixture exists yet; add one if the test harness gains expected-failure runtime support.
-
-### Owned resources on cancellation
-
-Imported `own<T>` cleanup reconstructs the wrapper from its raw handle and calls
-`.drop()`. Exported resources maintain a reverse instance-to-handle map and
-have instance-based drop dispatch. Generator tests cover both paths, and the
-established async matrices pass under both runtimes.
-
-### Full codegen
-
-The only observed full-codegen failure is the shared core ABI `todo!()` for async named fixed-length lists at `crates/core/src/abi.rs:2486`.
-
-## Untracked Worktree Content
-
-Many diagnostic artifacts are present. Do not delete them unless explicitly requested or ownership is confirmed:
-
-- malformed `C...Temp...` files;
-- `artifacts-as-*`, `artifacts-c-simple`, and `artifacts-review-async-import`;
-- `nul`;
-- `return.wat`;
-- untracked `tests/runtime/return-string/runner.ts` and `test.rs`;
-- untracked `tests/runtime/error-context/`.
-
-Stashes:
-
-- `stash@{0}`: `wip global async import result slots` (rejected because global result slots overwrite concurrent ownership).
-- `stash@{1}`: `wip opaque async task ids` (rejected because it leaked/retained tasks and did not solve incremental behavior).
-
-Do not apply or drop either stash blindly.
+`Scheduler.start` traps when context-0 is occupied. A save/restore stack is not
+correct because callback arguments carry no task identity.
 
 ## Recommended Next Steps
 
-1. Diagnose managed async result lifting with a minimal string progression. The return-string experiment compiles, minimal passes, and incremental traps in AssemblyScript GC/runtime code. Do not commit an unvalidated string-lift change; incremental is the required gate.
-2. Isolate the error-context runtime trap under both runtime selections.
-4. Repeated cancellation is now rejected locally: generated subtasks set `cancellationRequested` before invoking `[subtask-cancel]`, while retaining the handle for the one required `[subtask-drop]` during `dispose`/`finish`. Unit test `async_import_cancel_is_exactly_once` pins the emitted guard. The existing cancellation fixture passes under both runtime selections. A runtime test cannot safely invoke the second call because the canonical ABI requires it to trap.
-5. Reentrancy is now explicitly rejected: `Scheduler.start` traps when context-0 is occupied because callback arguments do not identify a task and save/restore would misroute suspended parent/child callbacks. Unit test `scheduler_rejects_reentrant_tasks` pins the guard. No end-to-end trap fixture was added because the runtime harness has no established expected-failure fixture path. The established async matrices pass under both runtime selections with this guard.
-6. Decide whether typed stream/future payload APIs are in scope. Current stream support exposes raw pointer/length payload access; no AssemblyScript payload runtime fixture exists.
-7. Add a dedicated owned-resource cancellation fixture if runtime ownership coverage is required.
-8. Re-run full codegen after future ABI changes; no known AssemblyScript
-   codegen failures remain.
+1. **Restore Node/AssemblyScript**, then re-run the async matrices under both
+   `incremental` and `minimal`. Nothing about the AssemblyScript runtime should
+   be trusted until this happens, including the fixes in this pass.
+2. **Stop letting fixtures replace generated files.** Have the async fixtures
+   implement only the task subclass and consume the generated export glue, and
+   drop `--async=-run` from the runners, so generated async exports are actually
+   executed. This is the single highest-value change: it is what allowed the
+   defects above to survive a "fully validated" handoff.
+3. Fix exported-resource routing through the instance table.
+4. Implement post-return so synchronous exports release owned parameters.
+5. Emit `drop()` for owned error contexts, then add a runtime fixture.
+6. Test the self-free hypothesis for managed async import results.
 
 ## Useful Files
 
 - Generator: `crates/assemblyscript/src/lib.rs`.
-- Embedded runtime: `crates/assemblyscript/src/async/async.ts` and `crates/assemblyscript/src/async.rs`.
+- Embedded runtime: `crates/assemblyscript/src/async/async.ts` and
+  `crates/assemblyscript/src/async.rs`.
 - FFI: `crates/assemblyscript/src/ffi/ffi.ts`.
-- Endpoint generation: `emit_future_stream_helpers`, `emit_typed_future_helpers`, `emit_async_import_subtask`.
+- Endpoint generation: `emit_future_stream_helpers`, `emit_typed_future_helpers`,
+  `emit_async_import_subtask`.
 - Task generation: `emit_async_task_base`, `emit_async_export_support`.
-- Runtime fixtures: `tests/runtime/simple-yield`, `simple-future`, `simple-stream`, `simple-import-params-results`, `cancel-import`.
-- Canonical implementations: `crates/guest-rust/src/rt/async_support`, `crates/moonbit/src/async_support.rs`, `crates/c/src/lib.rs`.
+- Harness: `crates/test/src/assemblyscript.rs`.
+- Canonical implementations: `crates/guest-rust/src/rt/async_support`,
+  `crates/moonbit/src/async_support.rs`, `crates/c/src/lib.rs`.
 
 ## Validation Policy
-
-Before future commits:
 
 ```text
 cargo fmt --check
 cargo test -p wit-bindgen-assemblyscript
 cargo clippy -p wit-bindgen-assemblyscript --all-targets -- -D warnings
+cargo run test --languages rust,moonbit,c tests/codegen --artifacts <dir> --wasi-sdk-path <sdk>
 git diff --check
 ```
 
-For async behavior, always run both runtime selections:
+For async behavior, always run both runtime selections (requires Node):
 
 ```text
-cargo run test --languages rust,assemblyscript <focused tests> --artifacts <incremental artifacts> --rust-wit-bindgen-path ./crates/guest-rust
-WIT_BINDGEN_AS_RUNTIME=minimal cargo run test --languages rust,assemblyscript <focused tests> --artifacts <minimal artifacts> --rust-wit-bindgen-path ./crates/guest-rust
+cargo run test --languages rust,assemblyscript <tests> --artifacts <dir> --rust-wit-bindgen-path ./crates/guest-rust
+WIT_BINDGEN_AS_RUNTIME=minimal cargo run test --languages rust,assemblyscript <tests> --artifacts <dir> --rust-wit-bindgen-path ./crates/guest-rust
 ```
 
-Never stage `crates/c/*`, generated diagnostic artifacts, `nul`, or return-string experiments unless the next task explicitly owns them.
+Never stage `crates/c/*` — it holds unrelated concurrent work.

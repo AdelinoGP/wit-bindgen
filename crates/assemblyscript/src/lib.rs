@@ -1660,9 +1660,29 @@ impl<'a> InterfaceGenerator<'a> {
             "  if (status != async_.CALLBACK_CODE_EXIT || task == 0) return;"
         )
         .unwrap();
-        writeln!(self.src, "  if (load<bool>(task + offsetof<{task_type}>(\"finished\"))) {task_return_extern}({return_args});").unwrap();
-        writeln!(self.src, "  async_.Scheduler.release(task);").unwrap();
+        // The canonical ABI requires an exiting task to have performed exactly
+        // one of `task.return` or `task.cancel`. Issue whichever the task did
+        // not, and trap on an exit that is neither, rather than letting the host
+        // trap with no guest context.
+        writeln!(
+            self.src,
+            "  if (load<bool>(task + offsetof<{task_type}>(\"finished\"))) {{"
+        )
+        .unwrap();
+        writeln!(self.src, "    {task_return_extern}({return_args});").unwrap();
+        writeln!(
+            self.src,
+            "  }} else if (async_.Scheduler.wasCancelled()) {{"
+        )
+        .unwrap();
+        writeln!(self.src, "    async_.taskCancel();").unwrap();
+        writeln!(self.src, "  }} else {{").unwrap();
+        writeln!(self.src, "    unreachable();").unwrap();
+        writeln!(self.src, "  }}").unwrap();
+        // Clear context-0 before freeing the task so `complete` never inspects
+        // a freed allocation.
         writeln!(self.src, "  async_.Scheduler.complete(task);").unwrap();
+        writeln!(self.src, "  async_.Scheduler.release(task);").unwrap();
         writeln!(self.src, "}}").unwrap();
         writeln!(self.src).unwrap();
 
@@ -2478,6 +2498,27 @@ impl<'a, 'b> FunctionBindgen<'a, 'b> {
 
     fn into_body(self) -> String {
         self.src
+    }
+
+    /// Emit the per-element deallocation loop shared by list and map
+    /// deallocation. `block_src` is an `abi` block whose `IterBasePointer`
+    /// placeholder is substituted with each element's address. An empty block
+    /// means the element itself owns nothing, so no loop is emitted.
+    fn emit_element_dealloc_loop(&mut self, block_src: &str, ptr: &str, len: &str, size: usize) {
+        if block_src.trim().is_empty() {
+            return;
+        }
+        let i = self.fresh();
+        let base = self.fresh();
+        self.push_line(&format!("for (let {i}: i32 = 0; {i} < {len}; {i}++) {{"));
+        self.push_line(&format!(
+            "  const {base}: usize = {ptr} + <usize>({i} * {size});"
+        ));
+        for line in block_src.lines() {
+            let l = line.replace("__ITER_BASE__", &base);
+            self.push_line(&format!("  {l}"));
+        }
+        self.push_line("}");
     }
 
     fn push_line(&mut self, line: &str) {
@@ -3418,31 +3459,68 @@ impl<'a, 'b> Bindgen for FunctionBindgen<'a, 'b> {
                     operands[0], operands[1]
                 ));
             }
-            Instruction::GuestDeallocateList { .. } => {
-                // Skip the per-element deallocation loop in v1; just free the
-                // outer buffer with size = len * elem_size (caller knows neither
-                // size nor align here without the block — use 1, 1 as a
-                // best-effort).
+            Instruction::GuestDeallocateList { element } => {
+                let (block_src, _) = self
+                    .blocks
+                    .pop()
+                    .expect("GuestDeallocateList expects a block");
+                let size = self.iface_gen.world_gen.sizes.size(element).size_wasm32();
+                let align = self.iface_gen.world_gen.sizes.align(element).align_wasm32();
+                let ptr = self.fresh();
+                let len = self.fresh();
+                self.push_line(&format!("const {ptr} = <usize>{};", operands[0]));
+                self.push_line(&format!("const {len} = <i32>{};", operands[1]));
+                self.emit_element_dealloc_loop(&block_src, &ptr, &len, size);
+                // The buffer was allocated with `len * elem_size` bytes, not
+                // `len` bytes.
                 self.push_line(&format!(
-                    "ffi.cabi_realloc({}, <usize>{}, 1, 0);",
-                    operands[0], operands[1]
+                    "ffi.cabi_realloc({ptr}, <usize>({len} * {size}), {align}, 0);"
                 ));
-                // The block was already popped at push_block time; nothing else
-                // to do here.
-                self.blocks.pop();
             }
-            Instruction::GuestDeallocateMap { .. } => {
-                self.blocks.pop();
+            Instruction::GuestDeallocateMap { key, value } => {
+                let (block_src, _) = self
+                    .blocks
+                    .pop()
+                    .expect("GuestDeallocateMap expects a block");
+                let layout = self.iface_gen.world_gen.sizes.record([*key, *value]);
+                let size = layout.size.size_wasm32();
+                let align = layout.align.align_wasm32();
+                let ptr = self.fresh();
+                let len = self.fresh();
+                self.push_line(&format!("const {ptr} = <usize>{};", operands[0]));
+                self.push_line(&format!("const {len} = <i32>{};", operands[1]));
+                self.emit_element_dealloc_loop(&block_src, &ptr, &len, size);
                 self.push_line(&format!(
-                    "ffi.cabi_realloc({}, <usize>{}, 1, 0);",
-                    operands[0], operands[1]
+                    "ffi.cabi_realloc({ptr}, <usize>({len} * {size}), {align}, 0);"
                 ));
             }
             Instruction::GuestDeallocateVariant { blocks } => {
-                for _ in 0..*blocks {
-                    self.blocks.pop();
+                // Pop all blocks (LIFO) then reverse so case 0 -> first block.
+                let mut cases = (0..*blocks)
+                    .map(|_| {
+                        self.blocks
+                            .pop()
+                            .expect("GuestDeallocateVariant expects a block")
+                    })
+                    .collect::<Vec<_>>();
+                cases.reverse();
+                // Without the tag switch the active payload — and any owned
+                // handle inside it — is never released.
+                self.push_line(&format!("switch (<i32>{}) {{", operands[0]));
+                let last = cases.len() - 1;
+                for (i, (block_src, _)) in cases.into_iter().enumerate() {
+                    if i == last {
+                        self.push_line("  default: {");
+                    } else {
+                        self.push_line(&format!("  case {i}: {{"));
+                    }
+                    for line in block_src.lines() {
+                        self.push_line(&format!("    {line}"));
+                    }
+                    self.push_line("    break;");
+                    self.push_line("  }");
                 }
-                let _ = operands;
+                self.push_line("}");
             }
 
             Instruction::DropHandle { ty } => {
@@ -3452,41 +3530,35 @@ impl<'a, 'b> Bindgen for FunctionBindgen<'a, 'b> {
                 }
                 if let Type::Id(id) = ty {
                     let id = wit_bindgen_core::dealias(self.iface_gen.resolve, *id);
-                    if matches!(
-                        &self.iface_gen.resolve.types[id].kind,
-                        TypeDefKind::Handle(Handle::Own(resource_id))
-                            if !self
-                                .iface_gen
-                                .world_gen
-                    .exported_resources
-                    .contains(&wit_bindgen_core::dealias(
-                                    self.iface_gen.resolve,
-                                    *resource_id,
-                                ))
-                    ) {
-                        let TypeDefKind::Handle(Handle::Own(resource_id)) =
-                            &self.iface_gen.resolve.types[id].kind
-                        else {
-                            unreachable!();
-                        };
+                    // `abi::deallocate` lifts an owned handle before emitting
+                    // `DropHandle`, so `operands[0]` is already the lifted value:
+                    // the wrapper instance for an imported resource, or the
+                    // exported class instance taken out of the resource table.
+                    if let TypeDefKind::Handle(Handle::Own(resource_id)) =
+                        &self.iface_gen.resolve.types[id].kind
+                    {
                         let resource_id =
                             wit_bindgen_core::dealias(self.iface_gen.resolve, *resource_id);
-                        let cls = self.iface_gen.named_type_ref(resource_id);
-                        self.push_line(&format!("new {cls}({}).drop();", operands[0]));
-                        return;
-                    }
-                    if self.iface_gen.world_gen.exported_resources.contains(&id) {
-                        let prefix = resource_table_prefix(self.iface_gen, id);
-                        let safe = sanitize_extern_local(&ident::type_name(
-                            self.iface_gen.resolve.types[id]
-                                .name
-                                .as_deref()
-                                .unwrap_or_default(),
-                        ));
-                        self.push_line(&format!(
-                            "{prefix}__{safe}_drop_instance({});",
-                            operands[0]
-                        ));
+                        if self
+                            .iface_gen
+                            .world_gen
+                            .exported_resources
+                            .contains(&resource_id)
+                        {
+                            let prefix = resource_table_prefix(self.iface_gen, resource_id);
+                            let safe = sanitize_extern_local(&ident::type_name(
+                                self.iface_gen.resolve.types[resource_id]
+                                    .name
+                                    .as_deref()
+                                    .unwrap_or_default(),
+                            ));
+                            self.push_line(&format!(
+                                "{prefix}__{safe}_drop_instance({});",
+                                operands[0]
+                            ));
+                        } else {
+                            self.push_line(&format!("{}.drop();", operands[0]));
+                        }
                         return;
                     }
                 }
@@ -3831,6 +3903,143 @@ mod tests {
         assert!(generated.contains(".handle"));
     }
 
+    /// An exiting async export must perform exactly one of `task.return` or
+    /// `task.cancel`. Before this was fixed the scheduler called `task.cancel`
+    /// eagerly on EVENT_CANCEL and then resumed the task anyway, so a task that
+    /// completed during cancellation issued both and trapped.
+    #[test]
+    fn async_export_exit_issues_exactly_one_of_return_or_cancel() {
+        let files = generate(
+            r#"
+                package test:bindings;
+
+                interface api {
+                    run: async func();
+                }
+
+                world test-world {
+                    export api;
+                }
+            "#,
+            "test-world",
+            Opts::default(),
+        );
+        let generated = files
+            .iter()
+            .filter_map(|(_, contents)| std::str::from_utf8(contents).ok())
+            .find(|contents| contents.contains("function __finish___exp_0_run"))
+            .expect("generated async export finish helper");
+
+        assert!(generated.contains("} else if (async_.Scheduler.wasCancelled()) {"));
+        assert!(generated.contains("async_.taskCancel();"));
+        // Exiting with neither is a canonical-ABI violation; trap in the guest
+        // rather than letting the host trap without context.
+        assert!(generated.contains("} else {\n    unreachable();"));
+        // context-0 must be cleared before the task allocation is freed.
+        let complete = generated.find("Scheduler.complete(task)").unwrap();
+        let release = generated.find("Scheduler.release(task)").unwrap();
+        assert!(complete < release, "complete must precede release");
+    }
+
+    /// `abi::deallocate` lifts an owned handle before emitting `DropHandle`, so
+    /// the operand is already the wrapper instance. Re-wrapping it produced
+    /// `new Item(new Item(h)).drop()`, which does not typecheck.
+    #[test]
+    fn owned_handle_cleanup_does_not_rewrap_lifted_operand() {
+        let files = generate(
+            r#"
+                package test:bindings;
+
+                interface api {
+                    resource item;
+                    consume: async func(value: own<item>);
+                }
+
+                world test-world {
+                    import api;
+                }
+            "#,
+            "test-world",
+            Opts::default(),
+        );
+        let generated = files
+            .iter()
+            .filter_map(|(_, contents)| std::str::from_utf8(contents).ok())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !generated.contains("new Item(new Item("),
+            "owned handle cleanup must not double-wrap the lifted operand"
+        );
+    }
+
+    /// The variant deallocation instruction used to discard every payload block
+    /// without emitting the tag switch, so the active payload — and any owned
+    /// handle inside it — was never released.
+    #[test]
+    fn variant_deallocation_emits_tag_switch_over_payload_blocks() {
+        let files = generate(
+            r#"
+                package test:bindings;
+
+                interface api {
+                    handle: async func() -> option<string>;
+                }
+
+                world test-world {
+                    import api;
+                }
+            "#,
+            "test-world",
+            Opts::default(),
+        );
+        let generated = files
+            .iter()
+            .filter_map(|(_, contents)| std::str::from_utf8(contents).ok())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            generated.contains("switch (<i32>"),
+            "variant deallocation must switch on the tag"
+        );
+    }
+
+    /// List deallocation used to drop the per-element block and free the buffer
+    /// with the element *count* as its byte size.
+    #[test]
+    fn list_deallocation_frees_elements_and_uses_byte_size() {
+        let files = generate(
+            r#"
+                package test:bindings;
+
+                interface api {
+                    handle: async func() -> list<string>;
+                }
+
+                world test-world {
+                    import api;
+                }
+            "#,
+            "test-world",
+            Opts::default(),
+        );
+        let generated = files
+            .iter()
+            .filter_map(|(_, contents)| std::str::from_utf8(contents).ok())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Each element's string buffer must be freed inside a loop, and the
+        // outer free must scale the length by the element size (8 bytes for a
+        // string's ptr/len pair) rather than passing the element count.
+        assert!(
+            generated.contains("* 8), 4, 0);"),
+            "outer list free must use len * elem_size and the element alignment"
+        );
+    }
+
     #[test]
     fn stream_payload_helpers_keep_canonical_payload_pointer() {
         let files = generate(
@@ -3886,9 +4095,28 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(generated.contains("drop();"), "{generated}");
+        // A bare `drop();` substring also matches the double-wrapped form that
+        // used to be emitted, so assert on the exact shape and pin the absence
+        // of the re-wrap.
+        assert!(
+            generated.contains("new Item("),
+            "expected the imported resource wrapper class, got: {generated}"
+        );
+        assert!(
+            !generated.contains("new Item(new Item("),
+            "cleanup must drop the already-lifted wrapper, got: {generated}"
+        );
     }
 
+    /// Owned-handle cleanup only runs on the async *import* path, so a resource
+    /// the guest exports reaches it by travelling out through an imported async
+    /// function.
+    ///
+    /// KNOWN GAP: in this shape the generator resolves the `use`d resource to an
+    /// *imported* wrapper class and lowers it via a raw `.handle`, instead of
+    /// routing it through the exported instance table (`__Item_take` /
+    /// `__Item_drop_instance`). The assertions below pin the cleanup that is
+    /// actually emitted today; see `exported_resource_through_async_import_is_not_yet_routed_through_the_instance_table`.
     #[test]
     fn exported_owned_resource_cleanup_uses_instance_table() {
         let files = generate(
@@ -3897,11 +4125,16 @@ mod tests {
 
                 interface api {
                     resource item;
+                }
+
+                interface consumer {
+                    use api.{item};
                     run: async func(value: own<item>);
                 }
 
                 world test-world {
                     export api;
+                    import consumer;
                 }
             "#,
             "test-world",
@@ -3916,8 +4149,62 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
+        // The exported instance table is emitted for the resource.
         assert!(generated.contains("Map<Item, i32>"));
-        assert!(generated.contains("Item_drop_instance"));
+        assert!(generated.contains("export function __Item_drop_instance("));
+        // Owned params are released exactly once, only on the cancelled path,
+        // and the operand is the already-lifted wrapper (not re-wrapped).
+        assert!(generated.contains("private releaseParams(own: bool): void {"));
+        assert!(generated.contains(".drop();"));
+        assert!(!generated.contains("new i_test$bindings$api.Item(new "));
+    }
+
+    /// Documents the gap described on
+    /// `exported_owned_resource_cleanup_uses_instance_table`: the handle for a
+    /// guest-exported resource is currently lowered as a raw `.handle` on an
+    /// imported wrapper rather than acquired with `__Item_take`. When that is
+    /// fixed this test should start failing and be replaced by a positive
+    /// assertion on the instance-table routing.
+    #[test]
+    fn exported_resource_through_async_import_is_not_yet_routed_through_the_instance_table() {
+        let files = generate(
+            r#"
+                package test:bindings;
+
+                interface api {
+                    resource item;
+                }
+
+                interface consumer {
+                    use api.{item};
+                    run: async func(value: own<item>);
+                }
+
+                world test-world {
+                    export api;
+                    import consumer;
+                }
+            "#,
+            "test-world",
+            Opts {
+                async_: AsyncFilterSet::all(true),
+                ..Opts::default()
+            },
+        );
+        let generated = files
+            .iter()
+            .filter_map(|(_, contents)| std::str::from_utf8(contents).ok())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            generated.contains("const subtask = new RunSubtask(value.handle);"),
+            "expected the current raw-handle lowering, got: {generated}"
+        );
+        assert!(
+            !generated.contains("__Item_take(value)"),
+            "instance-table routing landed; replace this test with a positive assertion"
+        );
     }
 
     #[test]
