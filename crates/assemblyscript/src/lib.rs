@@ -520,7 +520,13 @@ impl AssemblyScript {
 
     fn render_asconfig_json(&self) -> String {
         format!(
-            "{{\n  \"targets\": {{\n    \"release\": {{\n      \"outFile\": \"core.wasm\",\n      \"runtime\": \"{runtime}\",\n      \"exportRuntime\": true,\n      \"exportStart\": \"_start\",\n      \"optimizeLevel\": 3,\n      \"shrinkLevel\": 0,\n      \"converge\": false,\n      \"noAssert\": false,\n      \"use\": [\"abort=ffi/abort\"]\n    }},\n    \"debug\": {{\n      \"outFile\": \"core.wasm\",\n      \"runtime\": \"{runtime}\",\n      \"exportRuntime\": true,\n      \"exportStart\": \"_start\",\n      \"debug\": true,\n      \"use\": [\"abort=ffi/abort\"]\n    }}\n  }}\n}}\n",
+            // No `exportStart`: that would suppress the wasm `(start)` section
+            // and export `_start` for an embedder to call instead. Nothing calls
+            // it in a component, so the AssemblyScript runtime — including the
+            // TLSF heap — would stay uninitialized and the first managed
+            // allocation would abort. Emitting a real start section makes the
+            // component model run initialization at instantiation.
+            "{{\n  \"targets\": {{\n    \"release\": {{\n      \"outFile\": \"core.wasm\",\n      \"runtime\": \"{runtime}\",\n      \"exportRuntime\": true,\n      \"optimizeLevel\": 3,\n      \"shrinkLevel\": 0,\n      \"converge\": false,\n      \"noAssert\": false,\n      \"use\": [\"abort=ffi/abort\"]\n    }},\n    \"debug\": {{\n      \"outFile\": \"core.wasm\",\n      \"runtime\": \"{runtime}\",\n      \"exportRuntime\": true,\n      \"debug\": true,\n      \"use\": [\"abort=ffi/abort\"]\n    }}\n  }}\n}}\n",
             runtime = self.opts.runtime.as_asc_name()
         )
     }
@@ -1132,6 +1138,7 @@ impl<'a> InterfaceGenerator<'a> {
             bindgen.push_line(&format!("const value = {value};"));
         }
         bindgen.push_line("this.cleanup(false);");
+        bindgen.push_line("this.release();");
         if func.result.is_some() {
             bindgen.push_line("return value;");
         }
@@ -1163,6 +1170,7 @@ impl<'a> InterfaceGenerator<'a> {
             "    this.cleanup(this.state == async_.STATUS_RETURNED);"
         )
         .unwrap();
+        writeln!(self.src, "    this.release();").unwrap();
         writeln!(self.src, "    return cancelled;").unwrap();
         writeln!(self.src, "  }}").unwrap();
 
@@ -1184,6 +1192,33 @@ impl<'a> InterfaceGenerator<'a> {
                 .find_futures_and_streams(bindgen.iface_gen.resolve)
                 .len();
             abi::deallocate_lists_and_own_in_types(
+                bindgen.iface_gen.resolve,
+                std::slice::from_ref(result),
+                &["this.result".into()],
+                true,
+                &mut bindgen,
+            );
+            for line in bindgen.into_body().lines() {
+                writeln!(self.src, "      {line}").unwrap();
+            }
+            // On the success path the result was lifted: lists and strings were
+            // copied out, so their canonical buffers must still be freed, but
+            // owned handles were transferred to the lifted value and must not be
+            // dropped here.
+            writeln!(self.src, "    }} else {{").unwrap();
+            let mut bindgen = FunctionBindgen::new(
+                self,
+                func,
+                AbiVariant::GuestImportAsync,
+                LiftLower::LowerArgsLiftResults,
+                String::new(),
+            );
+            let mut params_only = func.clone();
+            params_only.result = None;
+            bindgen.next_endpoint = params_only
+                .find_futures_and_streams(bindgen.iface_gen.resolve)
+                .len();
+            abi::deallocate_lists_in_types(
                 bindgen.iface_gen.resolve,
                 std::slice::from_ref(result),
                 &["this.result".into()],
@@ -1221,6 +1256,14 @@ impl<'a> InterfaceGenerator<'a> {
         writeln!(self.src, "      async_.subtaskDrop(this.handle);").unwrap();
         writeln!(self.src, "      this.handle = 0;").unwrap();
         writeln!(self.src, "    }}").unwrap();
+        writeln!(self.src, "  }}").unwrap();
+        // The subtask must not free itself from inside its own method: the
+        // caller still holds the pointer, and with the allocation released the
+        // optimizer is free to reorder the remaining field accesses against the
+        // free. Release it through an opaque call as the last statement of
+        // `finish`/`dispose` instead.
+        writeln!(self.src, "  @inline(false)").unwrap();
+        writeln!(self.src, "  private release(): void {{").unwrap();
         writeln!(self.src, "    heap.free(changetype<usize>(this));").unwrap();
         writeln!(self.src, "  }}").unwrap();
         writeln!(self.src, "}}").unwrap();
@@ -4037,6 +4080,35 @@ mod tests {
         assert!(
             generated.contains("* 8), 4, 0);"),
             "outer list free must use len * elem_size and the element alignment"
+        );
+    }
+
+    /// `exportStart` suppresses the wasm `(start)` section and exports `_start`
+    /// for an embedder to call. Nothing calls it in a component, so the
+    /// AssemblyScript runtime stayed uninitialized and the first managed
+    /// allocation aborted — which is why only all-scalar fixtures ever passed.
+    #[test]
+    fn asconfig_emits_a_start_section_so_the_runtime_is_initialized() {
+        let files = generate(
+            r#"
+                package test:bindings;
+
+                world test-world {
+                    export run: func();
+                }
+            "#,
+            "test-world",
+            Opts::default(),
+        );
+        let asconfig = files
+            .iter()
+            .find(|(name, _)| *name == "asconfig.json")
+            .map(|(_, contents)| String::from_utf8(contents.to_vec()).unwrap())
+            .expect("generated asconfig.json");
+
+        assert!(
+            !asconfig.contains("exportStart"),
+            "asconfig must not set exportStart, got: {asconfig}"
         );
     }
 

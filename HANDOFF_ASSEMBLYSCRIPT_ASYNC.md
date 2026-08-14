@@ -16,23 +16,12 @@ future and stream endpoints, error-context support, typed ownership,
 cancellation, tests, and both AssemblyScript runtimes (`incremental` and
 `minimal`).
 
-## Blocking Environment Issue
+## Environment Note
 
-`node`, `npm`, and therefore `asc` are **not available in this environment**.
-They were present earlier in the session (`node v26.2.0`, `npm 11.13.0`) and
-disappeared mid-session: both vfox Node SDK directories
-(`~/.vfox/cache/nodejs/v-26.2.0`, `v-25.8.2`) contain no binaries, and there is
-no system Node install.
-
-Consequences:
-
-- No AssemblyScript runtime fixture can be built or executed.
-- No AssemblyScript **codegen** test can run either: verification shells out to
-  `asc --noEmit`, and `prepare()` hard-fails when `asc` is missing.
-- The generator changes described below are covered by Rust unit tests that
-  assert on emitted source text. **They have not been type-checked by `asc`.**
-
-Restore Node/AssemblyScript before trusting any AssemblyScript result.
+The vfox Node SDK directories can end up present-but-empty, in which case
+`vfox install nodejs@<v>` reports "already installed" and does nothing while
+`node`/`npm`/`asc` are all missing. Recover with `vfox uninstall nodejs@<v>`
+followed by a fresh install, then `npm i -g assemblyscript`.
 
 ## Corrected Claims
 
@@ -104,7 +93,8 @@ rust/moonbit/c codegen suite passes (1378 tests).
 
 ## Fixed In This Pass
 
-All covered by `cargo test -p wit-bindgen-assemblyscript` (18 tests).
+All covered by `cargo test -p wit-bindgen-assemblyscript` (19 tests) and, unless
+noted, by the runtime suite under both AssemblyScript runtimes.
 
 - **Owned-handle cleanup double-wrapped the operand.** `abi::deallocate` lifts an
   owned handle before emitting `DropHandle`, so the operand is already the
@@ -138,8 +128,22 @@ All covered by `cargo test -p wit-bindgen-assemblyscript` (18 tests).
   `@unmanaged` contract documented in the same file and was superseded by the
   per-function generated subtask.
 
+- **The AssemblyScript runtime was never initialized.** The generated
+  `asconfig.json` set `exportStart: "_start"`, which suppresses the wasm
+  `(start)` section and exports `_start` for an embedder to call. Nothing calls
+  it in a component, so the TLSF heap stayed uninitialized and the *first*
+  managed allocation aborted. This is why every fixture that ever passed used
+  only scalars, and it — not GC sequencing or ownership — was the real cause of
+  the long-standing "managed async import results" gap. Removing `exportStart`
+  fixes it; pinned by
+  `asconfig_emits_a_start_section_so_the_runtime_is_initialized`.
+- **Async import results leaked their canonical buffer.** `finish()` ran
+  `cleanup(false)`, which deallocated nothing. Lifting *copies* lists and
+  strings but *transfers* owned handles, so the success path now runs a
+  lists-only deallocation while the discard path keeps lists-and-own.
+
 `tests/runtime/cancel-import/test.ts` was updated to match the corrected
-cancellation protocol. It could not be executed (see the environment issue).
+cancellation protocol and passes under both runtimes.
 
 ## Open Bugs
 
@@ -168,26 +172,6 @@ owned parameters.
 
 No `drop()` is emitted for an owned incoming `error-context`; the generated
 export lifts it and returns `.handle` without releasing it.
-
-### Managed async import results (unchanged, undiagnosed)
-
-Scalar async import results work. Managed results were reported to trap under
-`incremental`. The experiment fixtures no longer exist and could not be recreated
-without Node.
-
-A concrete, untested hypothesis from the review: the generated `{X}Subtask`
-frees itself — `cleanup()` ends with `heap.free(changetype<usize>(this))` while
-`finish()` is still executing and the caller still holds the raw pointer, with
-nothing nulling it. AssemblyScript's TLSF stores free-list links at payload
-offsets 0 and 4, which are exactly the `status` and `state` fields that
-`update()` writes, so post-free writes would corrupt the allocator free list;
-`incremental` would then trap on the next `__new` (which a managed lift performs
-and a scalar path never does) while `minimal` never sweeps. This also explains
-why the recorded workarounds (copying into a `Uint16Array`, removing individual
-cleanup calls) had no effect.
-
-Cheapest falsification: remove the self-`heap.free`, accept the leak, and re-run
-under `incremental`. Requires Node.
 
 ### Typed endpoint payloads
 
@@ -234,18 +218,16 @@ correct because callback arguments carry no task identity.
 
 ## Recommended Next Steps
 
-1. **Restore Node/AssemblyScript**, then re-run the async matrices under both
-   `incremental` and `minimal`. Nothing about the AssemblyScript runtime should
-   be trusted until this happens, including the fixes in this pass.
-2. **Stop letting fixtures replace generated files.** Have the async fixtures
+1. **Stop letting fixtures replace generated files.** Have the async fixtures
    implement only the task subclass and consume the generated export glue, and
    drop `--async=-run` from the runners, so generated async exports are actually
    executed. This is the single highest-value change: it is what allowed the
    defects above to survive a "fully validated" handoff.
-3. Fix exported-resource routing through the instance table.
-4. Implement post-return so synchronous exports release owned parameters.
-5. Emit `drop()` for owned error contexts, then add a runtime fixture.
-6. Test the self-free hypothesis for managed async import results.
+2. Fix exported-resource routing through the instance table.
+3. Implement post-return so synchronous exports release owned parameters.
+4. Emit `drop()` for owned error contexts, then add a runtime fixture.
+5. Add AssemblyScript fixtures for the many `tests/runtime` directories that
+   have none — now that managed values work, most are newly reachable.
 
 ## Useful Files
 
