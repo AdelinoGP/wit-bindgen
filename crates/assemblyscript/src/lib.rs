@@ -1658,7 +1658,7 @@ impl<'a> InterfaceGenerator<'a> {
             String::new(),
         );
         bindgen.local_prefix = "__p";
-        bindgen.skip_endpoint_drops = true;
+        bindgen.export_param_cleanup = true;
         abi::deallocate_lists_and_own_in_types(
             bindgen.iface_gen.resolve,
             &types,
@@ -1701,8 +1701,9 @@ impl<'a> InterfaceGenerator<'a> {
             String::new(),
         );
         // Distinct local prefix: these lines are spliced into the wrapper body,
-        // which numbers its own locals from `v0`.
+        // which numbers its own locals from `__v0`.
         bindgen.local_prefix = "__d";
+        bindgen.export_param_cleanup = true;
         abi::deallocate_lists_and_own_in_types(
             bindgen.iface_gen.resolve,
             &types,
@@ -2944,13 +2945,26 @@ struct FunctionBindgen<'a, 'b> {
     /// Lifted exported-resource instances mapped to the raw handle they came
     /// from, so an owned handle can be released with `[resource-drop]`.
     lifted_handles: HashMap<String, String>,
-    /// Suppress `DropHandle` for future/stream endpoints.
+    /// This body releases an export's parameters after the user call.
     ///
-    /// An async export's task drives its endpoints across suspensions and drops
-    /// them itself, exactly as `test.c` does; releasing them again when the
-    /// task exits would double-drop. Owned resources, lists, strings, and error
-    /// contexts are still released.
-    skip_endpoint_drops: bool,
+    /// Only what the *generator* took responsibility for is released here:
+    ///
+    /// - List and string buffers, which lifting copied. Nothing else can free
+    ///   them, and the user is never handed a pointer to them.
+    /// - Owned handles to resources this world *exports*, because the user
+    ///   receives the class instance and has no way to name the handle.
+    ///
+    /// Everything else is the user's, and dropping it behind their back would
+    /// be a use-after-free rather than a leak:
+    ///
+    /// - An owned handle to an *imported* resource arrives as a wrapper with an
+    ///   explicit `drop()`, and passing it straight back out is legal — see the
+    ///   `leaf-toplevel` component of `resource-import-and-export`, whose whole
+    ///   body is `return a`.
+    /// - Error contexts likewise have an explicit `drop()`.
+    /// - Future and stream endpoints are driven by the task across suspensions
+    ///   and dropped by it, exactly as `test.c` does.
+    export_param_cleanup: bool,
     /// Next future/stream occurrence in the function's canonical endpoint order.
     next_endpoint: usize,
     /// Output source written into the current block. Blocks accumulate into
@@ -2983,7 +2997,7 @@ impl<'a, 'b> FunctionBindgen<'a, 'b> {
             after_wasm_call: String::new(),
             async_export_arg_count: 0,
             lifted_handles: HashMap::new(),
-            skip_endpoint_drops: false,
+            export_param_cleanup: false,
             next_endpoint: 0,
             src: String::new(),
             blocks: Vec::new(),
@@ -4133,7 +4147,11 @@ impl<'a, 'b> Bindgen for FunctionBindgen<'a, 'b> {
 
             Instruction::DropHandle { ty } => {
                 if matches!(ty, Type::ErrorContext) {
-                    self.push_line(&format!("{}.drop();", operands[0]));
+                    // The user holds a wrapper with its own `drop()`, and may
+                    // legitimately hand the context back out.
+                    if !self.export_param_cleanup {
+                        self.push_line(&format!("{}.drop();", operands[0]));
+                    }
                     return;
                 }
                 if let Type::Id(id) = ty {
@@ -4169,7 +4187,9 @@ impl<'a, 'b> Bindgen for FunctionBindgen<'a, 'b> {
                                 .expect("owned exported-resource drop without a lifted handle")
                                 .clone();
                             self.push_line(&format!("{prefix}__{safe}_drop_own({handle});"));
-                        } else {
+                        } else if !self.export_param_cleanup {
+                            // An imported resource arrives as a wrapper with
+                            // its own `drop()`; the user may pass it back out.
                             self.push_line(&format!("{}.drop();", operands[0]));
                         }
                         return;
@@ -4188,7 +4208,8 @@ impl<'a, 'b> Bindgen for FunctionBindgen<'a, 'b> {
                         return;
                     }
                 };
-                if self.skip_endpoint_drops {
+                if self.export_param_cleanup {
+                    // Endpoints belong to the task, which drops them itself.
                     return;
                 }
                 let endpoints = self.func.find_futures_and_streams(self.iface_gen.resolve);
@@ -4873,7 +4894,7 @@ mod tests {
     }
 
     #[test]
-    fn error_context_uses_typed_wrapper_and_drop() {
+    fn error_context_parameters_stay_the_users_to_drop() {
         let files = generate(
             r#"
                 package test:bindings;
@@ -4898,12 +4919,17 @@ mod tests {
         assert!(generated.contains("async_.ErrorContext"));
         assert!(generated.contains("new async_.ErrorContext"));
         assert!(generated.contains(".handle"));
-        // The export receives an owned error-context. Lifting only wraps the
-        // handle, so the wrapper has to release it after the user call — this
-        // assertion is the point of the test and used to be missing.
+        // The export receives an owned error-context wrapped in a typed value
+        // that carries its own `drop()`. The wrapper must *not* release it:
+        // `round-trip` hands the same context straight back, and dropping it
+        // first would return a dead handle.
         assert!(
-            generated.contains("new async_.ErrorContext(<i32>a0).drop();"),
-            "an owned error-context parameter must be dropped"
+            !generated.contains("new async_.ErrorContext(<i32>a0).drop();"),
+            "an error-context parameter is the user's to drop"
+        );
+        assert!(
+            generated.contains("drop(): void {"),
+            "the wrapper exposes drop"
         );
     }
 
