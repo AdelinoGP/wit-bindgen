@@ -1885,6 +1885,11 @@ impl<'a> InterfaceGenerator<'a> {
             .into_iter()
             .enumerate()
         {
+            if let TypeDefKind::Stream(Some(payload)) = &self.resolve.types[ty].kind {
+                let payload = *payload;
+                self.emit_typed_stream_helpers(func, index, payload);
+                continue;
+            }
             let TypeDefKind::Future(payload) = &self.resolve.types[ty].kind else {
                 continue;
             };
@@ -2017,6 +2022,204 @@ impl<'a> InterfaceGenerator<'a> {
                 writeln!(self.src, "  finishFuture{index}Write(): void {{}}").unwrap();
             }
         }
+    }
+
+    /// Typed read/write helpers for a `stream<T>` endpoint.
+    ///
+    /// Streams previously had raw endpoint helpers only, leaving every guest to
+    /// size its own buffer and lift or lower each element by hand. These carry a
+    /// growable element buffer on the task, so a stream payload is exchanged as
+    /// an ordinary AssemblyScript list.
+    fn emit_typed_stream_helpers(&mut self, func: &Function, index: usize, payload: Type) {
+        let stem = format!(
+            "rawExport{}Stream{index}",
+            ident::type_name(&Self::func_ident(&func.name))
+        );
+        let buffer = format!("stream{index}Buffer");
+        let capacity = format!("stream{index}Capacity");
+        let layout = self.world_gen.sizes.record([&payload]);
+        let size = layout.size.size_wasm32();
+        let align = layout.align.align_wasm32();
+        let list_ty = self.list_type_ref(&payload);
+
+        writeln!(self.src, "  private {buffer}: usize = 0;").unwrap();
+        writeln!(self.src, "  private {capacity}: i32 = 0;").unwrap();
+
+        writeln!(
+            self.src,
+            "  private reserveStream{index}(count: i32): void {{"
+        )
+        .unwrap();
+        writeln!(self.src, "    if (count <= this.{capacity}) return;").unwrap();
+        writeln!(
+            self.src,
+            "    this.{buffer} = ffi.cabi_realloc(this.{buffer}, <usize>(this.{capacity} * {size}), {align}, <usize>(count * {size}));"
+        )
+        .unwrap();
+        writeln!(self.src, "    this.{capacity} = count;").unwrap();
+        writeln!(self.src, "  }}").unwrap();
+
+        // Read
+        writeln!(
+            self.src,
+            "  startStream{index}Read(handle: i32, count: i32): i32 {{"
+        )
+        .unwrap();
+        writeln!(self.src, "    this.reserveStream{index}(count);").unwrap();
+        writeln!(
+            self.src,
+            "    return {stem}Read(handle, this.{buffer}, count);"
+        )
+        .unwrap();
+        writeln!(self.src, "  }}").unwrap();
+
+        writeln!(
+            self.src,
+            "  /// Lift `count` elements, which must be the count the canonical read reported."
+        )
+        .unwrap();
+        writeln!(
+            self.src,
+            "  finishStream{index}Read(count: i32): {list_ty} {{"
+        )
+        .unwrap();
+        let list_new = self.list_new_expr(&payload, "count");
+        writeln!(self.src, "    const values = {list_new};").unwrap();
+        writeln!(self.src, "    for (let i = 0; i < count; i++) {{").unwrap();
+        writeln!(
+            self.src,
+            "      const base: usize = this.{buffer} + <usize>(i * {size});"
+        )
+        .unwrap();
+        let mut bindgen = FunctionBindgen::new(
+            self,
+            func,
+            AbiVariant::GuestExportAsync,
+            LiftLower::LowerArgsLiftResults,
+            String::new(),
+        );
+        let value = abi::lift_from_memory(
+            bindgen.iface_gen.resolve,
+            &mut bindgen,
+            "base".into(),
+            &payload,
+        );
+        bindgen.push_line(&format!("values[i] = {value};"));
+        abi::deallocate_lists_in_types(
+            bindgen.iface_gen.resolve,
+            &[payload],
+            &["base".to_string()],
+            true,
+            &mut bindgen,
+        );
+        for line in bindgen.into_body().lines() {
+            writeln!(self.src, "      {line}").unwrap();
+        }
+        writeln!(self.src, "    }}").unwrap();
+        writeln!(self.src, "    return values;").unwrap();
+        writeln!(self.src, "  }}").unwrap();
+
+        // Write
+        writeln!(
+            self.src,
+            "  startStream{index}Write(handle: i32, values: {list_ty}): i32 {{"
+        )
+        .unwrap();
+        writeln!(self.src, "    const count = <i32>values.length;").unwrap();
+        writeln!(self.src, "    this.reserveStream{index}(count);").unwrap();
+        writeln!(self.src, "    for (let i = 0; i < count; i++) {{").unwrap();
+        writeln!(
+            self.src,
+            "      const base: usize = this.{buffer} + <usize>(i * {size});"
+        )
+        .unwrap();
+        let mut bindgen = FunctionBindgen::new(
+            self,
+            func,
+            AbiVariant::GuestExportAsync,
+            LiftLower::LowerArgsLiftResults,
+            String::new(),
+        );
+        abi::lower_to_memory(
+            bindgen.iface_gen.resolve,
+            &mut bindgen,
+            "base".into(),
+            "values[i]".into(),
+            &payload,
+        );
+        for line in bindgen.into_body().lines() {
+            writeln!(self.src, "      {line}").unwrap();
+        }
+        writeln!(self.src, "    }}").unwrap();
+        writeln!(
+            self.src,
+            "    return {stem}Write(handle, this.{buffer}, count);"
+        )
+        .unwrap();
+        writeln!(self.src, "  }}").unwrap();
+
+        writeln!(
+            self.src,
+            "  /// Release whatever the written elements lowered into linear memory."
+        )
+        .unwrap();
+        let mut bindgen = FunctionBindgen::new(
+            self,
+            func,
+            AbiVariant::GuestExportAsync,
+            LiftLower::LowerArgsLiftResults,
+            String::new(),
+        );
+        abi::deallocate_lists_in_types(
+            bindgen.iface_gen.resolve,
+            &[payload],
+            &["base".to_string()],
+            true,
+            &mut bindgen,
+        );
+        let write_cleanup = bindgen.into_body();
+        writeln!(self.src, "  finishStream{index}Write(count: i32): void {{").unwrap();
+        if write_cleanup.trim().is_empty() {
+            // A scalar payload owns nothing, so there is nothing to walk.
+            writeln!(self.src, "    // nothing to release for this payload").unwrap();
+        } else {
+            writeln!(self.src, "    for (let i = 0; i < count; i++) {{").unwrap();
+            writeln!(
+                self.src,
+                "      const base: usize = this.{buffer} + <usize>(i * {size});"
+            )
+            .unwrap();
+            for line in write_cleanup.lines() {
+                writeln!(self.src, "      {line}").unwrap();
+            }
+            writeln!(self.src, "    }}").unwrap();
+        }
+        writeln!(self.src, "  }}").unwrap();
+    }
+
+    /// AssemblyScript type of a `list<elem>`, matching what `type_id_ref`
+    /// produces for `TypeDefKind::List`.
+    fn list_type_ref(&mut self, elem: &Type) -> String {
+        match elem {
+            Type::U8 => "Uint8Array".into(),
+            Type::S8 => "Int8Array".into(),
+            Type::U16 => "Uint16Array".into(),
+            Type::S16 => "Int16Array".into(),
+            Type::U32 => "Uint32Array".into(),
+            Type::S32 => "Int32Array".into(),
+            Type::U64 => "Uint64Array".into(),
+            Type::S64 => "Int64Array".into(),
+            Type::F32 => "Float32Array".into(),
+            Type::F64 => "Float64Array".into(),
+            other => {
+                let inner = self.type_ref(other);
+                format!("Array<{inner}>")
+            }
+        }
+    }
+
+    fn list_new_expr(&mut self, elem: &Type, len: &str) -> String {
+        format!("new {}({len})", self.list_type_ref(elem))
     }
 
     fn emit_async_export_support(
@@ -4881,6 +5084,49 @@ mod tests {
         assert!(stub.contains("export function staticXAdd("));
         // A freestanding function keeps its plain name.
         assert!(stub.contains("export function add(a: Z, b: Z): Z {"));
+    }
+
+    /// Futures had typed payload helpers on the task; streams had only the raw
+    /// endpoint imports, leaving every guest to size its own buffer and lift or
+    /// lower each element by hand.
+    #[test]
+    fn stream_endpoints_get_typed_payload_helpers() {
+        let files = generate(
+            r#"
+                package test:bindings;
+
+                interface api {
+                    bytes: async func(x: stream<u8>);
+                    names: async func(x: stream<string>);
+                }
+
+                world test-world {
+                    export api;
+                }
+            "#,
+            "test-world",
+            Opts::default(),
+        );
+        let glue = file(&files, "exports/test$bindings$api.ts");
+
+        // A scalar payload is exchanged as the matching typed array.
+        assert!(glue.contains("startStream0Read(handle: i32, count: i32): i32 {"));
+        assert!(glue.contains("finishStream0Read(count: i32): Uint8Array {"));
+        assert!(glue.contains("startStream0Write(handle: i32, values: Uint8Array): i32 {"));
+        // ...and owns nothing, so its write-finish has no loop to run.
+        assert!(glue.contains("// nothing to release for this payload"));
+
+        // A managed payload frees what each element lowered into memory, both
+        // after a read lifts it and after a write hands it over.
+        let names = glue
+            .split("class NamesTask")
+            .nth(1)
+            .expect("second task base");
+        assert!(names.contains("finishStream0Read(count: i32): Array<string> {"));
+        assert!(names.contains(
+            "ffi.cabi_realloc(load<usize>(base + 0), <usize>(load<usize>(base + 4) << 1), 2, 0);"
+        ));
+        assert!(names.contains("finishStream0Write(count: i32): void {"));
     }
 
     #[test]
