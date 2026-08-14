@@ -1,68 +1,104 @@
-//@ args = '--async=-run'
 //@ wasmtime-flags = '-Wcomponent-model-async'
 //@ [lang]
-//@ path = "world.ts"
+//@ path = "stubs/world.ts"
 
-import * as async_ from "./async";
-import * as i_a$b$i from "./imports/a$b$i";
+import * as async_ from "../async";
+import * as world from "../world";
+import * as i_a$b$i from "../imports/a$b$i";
 
 function assert(condition: bool): void {
   if (!condition) unreachable();
 }
 
 @unmanaged
-export class RunTask extends async_.AsyncTask {
-  set: i32 = 0;
-  first: usize = 0;
-  second: usize = 0;
-  pending: i32 = 0;
+class RunTask extends world.RunTask {
+  private step: i32 = 0;
+  private set: i32 = 0;
+  // Raw pointer to the in-flight `@unmanaged` subtask and the status code most
+  // recently observed for it. Nothing managed may survive a suspension.
+  private subtask: usize = 0;
+  private code: i32 = 0;
 
-  resume(_event: i32, _waitable: i32, _code: i32): i32 {
-    return async_.CALLBACK_CODE_EXIT;
-  }
-
-  run(): void {
-    const unit = i_a$b$i.oneArgument(1);
-    assert(unit.state == async_.STATUS_RETURNED);
-    unit.finish(unit.status);
-
-    const one = i_a$b$i.oneResult();
-    const two = i_a$b$i.twoArgumentsAndResult(7, 8);
-    this.first = changetype<usize>(one);
-    this.second = changetype<usize>(two);
-    this.set = async_.waitableSetNew();
-    this.pending = 2;
-    if (one.handle != 0) async_.waitableJoin(one.handle, this.set);
-    else { assert(one.finish(one.status) == 2); this.first = 0; this.pending--; }
-    if (two.handle != 0) async_.waitableJoin(two.handle, this.set);
-    else { assert(two.finish(two.status) == 9); this.second = 0; this.pending--; }
-
-    const payload = changetype<usize>(memory.data(8));
-    while (this.pending != 0) {
-      assert(async_.waitableSetWait(this.set, payload) == async_.EVENT_SUBTASK);
-      const waitable = load<i32>(payload);
-      const code = load<i32>(payload + 4);
-      if (this.first != 0 && changetype<i_a$b$i.OneResultSubtask>(this.first).handle == waitable) {
-        assert(changetype<i_a$b$i.OneResultSubtask>(this.first).finish(code) == 2);
-        this.first = 0;
-      } else {
-        assert(this.second != 0);
-        assert(changetype<i_a$b$i.TwoArgumentsAndResultSubtask>(this.second).finish(code) == 9);
-        this.second = 0;
-      }
-      this.pending--;
+  resume(event: i32, waitable: i32, code: i32): i32 {
+    if (event == async_.EVENT_SUBTASK) {
+      assert(waitable == this.pendingHandle());
+      this.code = code;
     }
 
-    async_.waitableSetDrop(this.set);
-    const mixed = i_a$b$i.oneArgumentAndResult(3);
-    assert(mixed.state == async_.STATUS_RETURNED);
-    assert(mixed.finish(mixed.status) == 4);
-    const twoUnit = i_a$b$i.twoArguments(5, 6);
-    assert(twoUnit.state == async_.STATUS_RETURNED);
-    twoUnit.finish(twoUnit.status);
+    while (true) {
+      switch (this.step) {
+        case 0: {
+          assert(event == async_.EVENT_NONE && waitable == 0 && code == 0);
+          this.set = async_.waitableSetNew();
+          const wait = this.begin(changetype<usize>(i_a$b$i.oneArgument(1)), 1);
+          if (wait != -1) return wait;
+          continue;
+        }
+
+        case 1: {
+          changetype<i_a$b$i.OneArgumentSubtask>(this.subtask).finish(this.code);
+          const wait = this.begin(changetype<usize>(i_a$b$i.oneResult()), 2);
+          if (wait != -1) return wait;
+          continue;
+        }
+
+        case 2: {
+          assert(changetype<i_a$b$i.OneResultSubtask>(this.subtask).finish(this.code) == 2);
+          const wait = this.begin(changetype<usize>(i_a$b$i.oneArgumentAndResult(3)), 3);
+          if (wait != -1) return wait;
+          continue;
+        }
+
+        case 3: {
+          assert(
+            changetype<i_a$b$i.OneArgumentAndResultSubtask>(this.subtask).finish(this.code) == 4
+          );
+          const wait = this.begin(changetype<usize>(i_a$b$i.twoArguments(5, 6)), 4);
+          if (wait != -1) return wait;
+          continue;
+        }
+
+        case 4: {
+          changetype<i_a$b$i.TwoArgumentsSubtask>(this.subtask).finish(this.code);
+          const wait = this.begin(changetype<usize>(i_a$b$i.twoArgumentsAndResult(7, 8)), 5);
+          if (wait != -1) return wait;
+          continue;
+        }
+
+        default: {
+          assert(
+            changetype<i_a$b$i.TwoArgumentsAndResultSubtask>(this.subtask).finish(this.code) == 9
+          );
+          this.subtask = 0;
+          async_.waitableSetDrop(this.set);
+          this.set = 0;
+          return this.finish();
+        }
+      }
+    }
+  }
+
+  /// Every generated `*Subtask` starts with the same scalar header, so one
+  /// accessor covers whichever call is in flight.
+  private pendingHandle(): i32 {
+    return changetype<i_a$b$i.OneArgumentSubtask>(this.subtask).handle;
+  }
+
+  /// Record `ptr` as the in-flight subtask, advance to `next`, and return the
+  /// callback code to suspend on — or -1 if it already completed.
+  private begin(ptr: usize, next: i32): i32 {
+    this.subtask = ptr;
+    this.step = next;
+    const subtask = changetype<i_a$b$i.OneArgumentSubtask>(ptr);
+    if (subtask.handle == 0) {
+      this.code = subtask.status;
+      return -1;
+    }
+    async_.waitableJoin(subtask.handle, this.set);
+    return async_.callbackWait(this.set);
   }
 }
 
-export function run(): void { new RunTask().run(); }
-
-export function __exp_18446744073709551615_run(): void { run(); }
+export function run(): world.RunTask {
+  return new RunTask();
+}

@@ -1,34 +1,57 @@
-//@ args = '--async=-run'
 //@ wasmtime-flags = '-Wcomponent-model-async'
 //@ [lang]
-//@ path = "world.ts"
+//@ path = "stubs/world.ts"
 
-import * as async_ from "./async";
-import * as i_a$b$i from "./imports/a$b$i";
+import * as async_ from "../async";
+import * as world from "../world";
+import * as i_a$b$i from "../imports/a$b$i";
 
 function assertEq<T>(actual: T, expected: T): void {
   if (actual != expected) unreachable();
 }
 
-export function run(): void {
-  for (let i = 0; i < 32; i++) {
-    const subtask = i_a$b$i.f();
-    assertEq(subtask.state, async_.STATUS_STARTED);
-    const task = subtask.handle;
-    assert(task != 0);
-    const set = async_.waitableSetNew();
-    async_.waitableJoin(task, set);
-    const payload = changetype<usize>(memory.data(8));
-    const event = async_.waitableSetWait(set, payload);
-    assertEq(event, async_.EVENT_SUBTASK);
-    assertEq(load<i32>(payload), task);
-    const status = load<i32>(payload + 4);
-    assertEq(status, async_.STATUS_RETURNED);
-    subtask.finish(status);
-    async_.waitableSetDrop(set);
+@unmanaged
+class RunTask extends world.RunTask {
+  private iteration: i32 = 0;
+  private set: i32 = 0;
+  // Raw pointer to the in-flight `@unmanaged` subtask; nothing managed may
+  // survive a yield.
+  private pending: usize = 0;
+
+  resume(event: i32, waitable: i32, code: i32): i32 {
+    if (this.pending != 0) {
+      const subtask = changetype<i_a$b$i.FSubtask>(this.pending);
+      assertEq(event, async_.EVENT_SUBTASK);
+      assertEq(waitable, subtask.handle);
+      assertEq(async_.subtaskState(code), async_.STATUS_RETURNED);
+      this.pending = 0;
+      subtask.finish(code);
+    }
+
+    while (this.iteration < 32) {
+      this.iteration++;
+      const subtask = i_a$b$i.f();
+      if (subtask.handle == 0) {
+        // Completed without ever becoming a waitable.
+        assertEq(subtask.state, async_.STATUS_RETURNED);
+        subtask.finish(subtask.status);
+        continue;
+      }
+      assertEq(subtask.state, async_.STATUS_STARTED);
+      if (this.set == 0) this.set = async_.waitableSetNew();
+      async_.waitableJoin(subtask.handle, this.set);
+      this.pending = changetype<usize>(subtask);
+      return async_.callbackWait(this.set);
+    }
+
+    if (this.set != 0) {
+      async_.waitableSetDrop(this.set);
+      this.set = 0;
+    }
+    return this.finish();
   }
 }
 
-export function __exp_18446744073709551615_run(): void {
-  run();
+export function run(): world.RunTask {
+  return new RunTask();
 }

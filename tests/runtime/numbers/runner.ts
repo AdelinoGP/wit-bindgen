@@ -1,8 +1,7 @@
 //@ [lang]
-//@ path = "world.ts"
+//@ path = "stubs/world.ts"
 
-import * as ffi from "./ffi";
-import * as i_test$numbers$numbers from "./imports/test$numbers$numbers";
+import * as i_test$numbers$numbers from "../imports/test$numbers$numbers";
 
 function assertEq<T>(actual: T, expected: T): void {
   if (actual != expected) unreachable();
@@ -51,10 +50,3 @@ export function run(): void {
   i_test$numbers$numbers.setScalar(4);
   assertEq<u32>(i_test$numbers$numbers.getScalar(), 4);
 }
-
-// wasm export wrapper — the generator emits this name for world-level `run`.
-export function __exp_18446744073709551615_run(): void { run(); }
-
-// keep ffi alive
-// @ts-ignore
-const _keepalive = ffi.cabi_realloc;

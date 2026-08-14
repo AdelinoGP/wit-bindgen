@@ -98,6 +98,18 @@ impl Opts {
 struct InterfaceFragment {
     /// Generated source body (types + function declarations).
     src: String,
+    /// User-implementation source body, emitted to `stubs/<basename>.ts`.
+    ///
+    /// Everything the user is expected to edit lives here — exported resource
+    /// classes and the entrypoint each exported function dispatches to. The
+    /// generated glue in `src` is therefore always safe to overwrite.
+    stub_src: String,
+    /// Value names (user functions) the glue imports from the stub file.
+    stub_values: BTreeSet<String>,
+    /// Type names (exported resource classes) defined in the stub file. The
+    /// glue imports these *and* re-exports them, so sibling files keep
+    /// referring to them as `e_<basename>.<Type>`.
+    stub_types: BTreeSet<String>,
     /// Set of "<basename>"s of sibling interface files this fragment imports
     /// types or call helpers from. Each becomes an `import * as i_<basename>`
     /// line at the top of the emitted file.
@@ -281,17 +293,21 @@ impl WorldGenerator for AssemblyScript {
         let import_interfaces = mem::take(&mut self.import_interfaces);
         for (basename, frag) in &import_interfaces {
             let path = format!("imports/{basename}.ts");
-            let body = render_interface_file(frag, "imports");
+            let body = render_interface_file(frag, "imports", basename);
             files.push(&path, body.as_bytes());
         }
 
-        // Emit exports/<basename>.ts files (stubs the user edits).
-        // Default policy is to overwrite. Under --ignore-stub we skip.
+        // Emit exports/<basename>.ts (generated glue, always overwritten) and
+        // stubs/<basename>.ts (the user's implementation, skipped under
+        // --ignore-stub).
         let export_interfaces = mem::take(&mut self.export_interfaces);
-        if !self.opts.ignore_stub {
-            for (basename, frag) in &export_interfaces {
-                let path = format!("exports/{basename}.ts");
-                let body = render_interface_file(frag, "exports");
+        for (basename, frag) in &export_interfaces {
+            let path = format!("exports/{basename}.ts");
+            let body = render_interface_file(frag, "exports", basename);
+            files.push(&path, body.as_bytes());
+            if !self.opts.ignore_stub {
+                let path = format!("stubs/{basename}.ts");
+                let body = render_stub_file(frag, "exports", basename);
                 files.push(&path, body.as_bytes());
             }
         }
@@ -315,8 +331,19 @@ impl WorldGenerator for AssemblyScript {
             combined.src.push_str(&self.world_imports.src);
             combined.src.push('\n');
             combined.src.push_str(&self.world_exports.src);
-            let body = render_interface_file(&combined, "world");
+            combined.stub_src.push_str(&self.world_exports.stub_src);
+            combined
+                .stub_values
+                .extend(self.world_exports.stub_values.iter().cloned());
+            combined
+                .stub_types
+                .extend(self.world_exports.stub_types.iter().cloned());
+            let body = render_interface_file(&combined, "world", "");
             files.push("world.ts", body.as_bytes());
+            if !self.opts.ignore_stub && !combined.stub_src.is_empty() {
+                let body = render_stub_file(&combined, "world", "");
+                files.push("stubs/world.ts", body.as_bytes());
+            }
         }
 
         // bindings.ts: the asc entry. Wasm-export wrappers inlined; dispatches
@@ -532,7 +559,7 @@ impl AssemblyScript {
     }
 }
 
-fn render_interface_file(frag: &InterfaceFragment, kind: &str) -> String {
+fn render_interface_file(frag: &InterfaceFragment, kind: &str, basename: &str) -> String {
     // `kind` is "imports" or "exports" → file lives one level down, prefix is
     // "../". For "world" the file lives at the root, prefix is "./".
     let prefix = if kind == "world" { "./" } else { "../" };
@@ -543,28 +570,93 @@ fn render_interface_file(frag: &InterfaceFragment, kind: &str) -> String {
     if frag.needs_async {
         writeln!(s, "import * as async_ from \"{prefix}async\";").unwrap();
     }
-    for basename in &frag.imports_imports {
-        writeln!(
-            s,
-            "import * as i_{basename} from \"{prefix}imports/{basename}\";"
-        )
-        .unwrap();
+    for other in &frag.imports_imports {
+        writeln!(s, "import * as i_{other} from \"{prefix}imports/{other}\";").unwrap();
     }
-    for basename in &frag.imports_exports {
+    for other in &frag.imports_exports {
+        writeln!(s, "import * as e_{other} from \"{prefix}exports/{other}\";").unwrap();
+    }
+    // The user-implementation half of this interface. Resource classes defined
+    // there are re-exported so sibling files keep seeing them on this module.
+    let names: Vec<&str> = frag
+        .stub_types
+        .iter()
+        .chain(frag.stub_values.iter())
+        .map(String::as_str)
+        .collect();
+    if !names.is_empty() {
         writeln!(
             s,
-            "import * as e_{basename} from \"{prefix}exports/{basename}\";"
+            "import {{ {} }} from \"{prefix}{}\";",
+            names.join(", "),
+            stub_module(kind, basename)
         )
         .unwrap();
+        if !frag.stub_types.is_empty() {
+            let types: Vec<&str> = frag.stub_types.iter().map(String::as_str).collect();
+            writeln!(s, "export {{ {} }};", types.join(", ")).unwrap();
+        }
     }
     writeln!(s).unwrap();
     s.push_str(&frag.src);
     s
 }
 
+/// Path (relative to the output root, minus extension) of the stub file paired
+/// with an export glue file.
+fn stub_module(kind: &str, basename: &str) -> String {
+    if kind == "world" {
+        "stubs/world".to_string()
+    } else {
+        format!("stubs/{basename}")
+    }
+}
+
+/// The user-implementation file paired with `exports/<basename>.ts` (or
+/// `world.ts`). Never regenerated once written when `--ignore-stub` is set.
+fn render_stub_file(frag: &InterfaceFragment, kind: &str, basename: &str) -> String {
+    let mut s = String::new();
+    writeln!(
+        s,
+        "// Generated by wit-bindgen {VERSION} as a starting point. Edit freely:"
+    )
+    .unwrap();
+    writeln!(
+        s,
+        "// this file holds your implementation, and `--ignore-stub` preserves it."
+    )
+    .unwrap();
+    writeln!(s).unwrap();
+    writeln!(s, "import * as ffi from \"../ffi\";").unwrap();
+    if frag.needs_async {
+        writeln!(s, "import * as async_ from \"../async\";").unwrap();
+    }
+    for other in &frag.imports_imports {
+        writeln!(s, "import * as i_{other} from \"../imports/{other}\";").unwrap();
+    }
+    for other in &frag.imports_exports {
+        writeln!(s, "import * as e_{other} from \"../exports/{other}\";").unwrap();
+    }
+    if kind == "world" {
+        writeln!(s, "import * as world from \"../world\";").unwrap();
+    } else if !frag.imports_exports.contains(basename) {
+        writeln!(
+            s,
+            "import * as e_{basename} from \"../exports/{basename}\";"
+        )
+        .unwrap();
+    }
+    writeln!(s).unwrap();
+    s.push_str(&frag.stub_src);
+    s
+}
+
 impl InterfaceFragment {
     fn concat(&mut self, other: InterfaceFragment) {
         self.src.push_str(&other.src);
+        self.stub_src.push_str(&other.stub_src);
+        self.stub_values.extend(other.stub_values);
+        self.stub_types.extend(other.stub_types);
         self.imports_imports.extend(other.imports_imports);
         self.imports_exports.extend(other.imports_exports);
         self.needs_async |= other.needs_async;
@@ -585,6 +677,14 @@ struct InterfaceGenerator<'a> {
     interface_key: Option<WorldKey>,
     direction: Direction,
     src: String,
+    /// User-implementation source for `stubs/<basename>.ts`.
+    stub_src: String,
+    /// True while writing into `stub_src`. Named types owned by this interface
+    /// live in the glue file, so references from the stub file must be
+    /// qualified with the glue namespace.
+    emitting_stub: bool,
+    stub_values: BTreeSet<String>,
+    stub_types: BTreeSet<String>,
     imports_imports: BTreeSet<String>,
     imports_exports: BTreeSet<String>,
     needs_async: bool,
@@ -605,10 +705,36 @@ impl<'a> InterfaceGenerator<'a> {
             interface_key,
             direction,
             src: String::new(),
+            stub_src: String::new(),
+            emitting_stub: false,
+            stub_values: BTreeSet::new(),
+            stub_types: BTreeSet::new(),
             imports_imports: BTreeSet::new(),
             imports_exports: BTreeSet::new(),
             needs_async: false,
         }
+    }
+
+    /// Namespace alias under which the *glue* file for this interface is
+    /// imported by its stub file.
+    fn glue_ns(&self) -> String {
+        match self
+            .interface
+            .and_then(|id| self.world_gen.export_basenames.get(&id))
+        {
+            Some(basename) => format!("e_{basename}"),
+            None => "world".to_string(),
+        }
+    }
+
+    /// Run `f` with output redirected into the user-implementation file.
+    fn with_stub(&mut self, f: impl FnOnce(&mut Self)) {
+        let outer = mem::take(&mut self.src);
+        let was_stub = mem::replace(&mut self.emitting_stub, true);
+        f(self);
+        self.emitting_stub = was_stub;
+        let stub = mem::replace(&mut self.src, outer);
+        self.stub_src.push_str(&stub);
     }
 
     fn types_inline(&mut self, iface: InterfaceId) {
@@ -629,6 +755,9 @@ impl<'a> InterfaceGenerator<'a> {
     fn finish(self) -> InterfaceFragment {
         InterfaceFragment {
             src: self.src,
+            stub_src: self.stub_src,
+            stub_values: self.stub_values,
+            stub_types: self.stub_types,
             imports_imports: self.imports_imports,
             imports_exports: self.imports_exports,
             needs_async: self.needs_async,
@@ -740,8 +869,19 @@ impl<'a> InterfaceGenerator<'a> {
                 let (basename, alias_prefix) = self.foreign_basename(other);
                 format!("{alias_prefix}{basename}.{local}")
             }
+            // Own type. Defined in the glue file, except exported resource
+            // classes, which the user implements in the stub file itself.
+            _ if self.emitting_stub && !self.is_own_exported_resource(canonical_id) => {
+                format!("{}.{local}", self.glue_ns())
+            }
             _ => local,
         }
+    }
+
+    /// True for a resource this world exports whose class body lives in this
+    /// interface's stub file.
+    fn is_own_exported_resource(&self, id: TypeId) -> bool {
+        self.world_gen.exported_resources.contains(&id)
     }
 
     /// Look up the basename of a foreign interface. Prefers import-side
@@ -1298,35 +1438,48 @@ impl<'a> InterfaceGenerator<'a> {
             self.emit_async_task_base(func, &user_ident, &sig);
         }
 
-        self.docs(&func.docs);
-        if is_async {
-            writeln!(
-                self.src,
-                "/// Return an `@unmanaged` state machine; persist only scalar handles/pointers across `resume` calls."
-            )
-            .unwrap();
-        }
-        let user_sig = if is_async {
-            sig.async_export_signature(&user_ident)
-        } else {
-            sig.user_signature(&user_ident)
-        };
-        writeln!(self.src, "export function {user_sig} {{").unwrap();
-        if is_async {
-            writeln!(
-                self.src,
-                "  return new {}Task();",
-                ident::type_name(&user_ident)
-            )
-            .unwrap();
-        } else {
-            writeln!(self.src, "  // TODO: implement").unwrap();
-            if let Some(ret_ty) = &sig.return_type {
-                writeln!(self.src, "  return {};", default_value_for(ret_ty)).unwrap();
+        // The user-facing entrypoint goes to `stubs/<basename>.ts`; the glue
+        // below imports it by name. Signature types must be re-resolved in stub
+        // scope, where this interface's own types live behind the glue
+        // namespace.
+        self.emitting_stub = true;
+        let stub_sig = self.func_signature(func, variant);
+        self.emitting_stub = false;
+        let docs = func.docs.clone();
+        let user = user_ident.clone();
+        let glue_ns = self.glue_ns();
+        self.with_stub(|g| {
+            g.docs(&docs);
+            if is_async {
+                writeln!(
+                    g.src,
+                    "/// Return an `@unmanaged` state machine; persist only scalar handles/pointers across `resume` calls."
+                )
+                .unwrap();
             }
-        }
-        writeln!(self.src, "}}").unwrap();
-        writeln!(self.src).unwrap();
+            let user_sig = if is_async {
+                stub_sig.async_export_signature(&user, &format!("{glue_ns}."))
+            } else {
+                stub_sig.user_signature(&user)
+            };
+            writeln!(g.src, "export function {user_sig} {{").unwrap();
+            if is_async {
+                writeln!(
+                    g.src,
+                    "  return new {glue_ns}.{}Task();",
+                    ident::type_name(&user)
+                )
+                .unwrap();
+            } else {
+                writeln!(g.src, "  // TODO: implement").unwrap();
+                if let Some(ret_ty) = &stub_sig.return_type {
+                    writeln!(g.src, "  return {};", default_value_for(ret_ty)).unwrap();
+                }
+            }
+            writeln!(g.src, "}}").unwrap();
+            writeln!(g.src).unwrap();
+        });
+        self.stub_values.insert(user_ident.clone());
 
         // 2. The wasm-export wrapper. Lives alongside the user stub in
         //    exports/<basename>.ts so it has direct access to the user function
@@ -1990,14 +2143,16 @@ impl FuncSig {
         format!("{name}({ps}): {}Subtask", ident::type_name(func_local))
     }
 
-    fn async_export_signature(&self, name: &str) -> String {
+    /// `qualifier` prefixes the task type, which is defined in the generated
+    /// glue file rather than alongside the user's implementation.
+    fn async_export_signature(&self, name: &str, qualifier: &str) -> String {
         let ps = self
             .params
             .iter()
             .map(|(n, t)| format!("{n}: {t}"))
             .collect::<Vec<_>>()
             .join(", ");
-        format!("{name}({ps}): {}Task", ident::type_name(name))
+        format!("{name}({ps}): {qualifier}{}Task", ident::type_name(name))
     }
 
     fn wasm_wrapper_signature(&self, name: &str) -> String {
@@ -2182,21 +2337,22 @@ impl<'a> CoreInterfaceGenerator<'a> for InterfaceGenerator<'a> {
             }
             Direction::Export => {
                 self.world_gen.exported_resources.push(id);
-                writeln!(
-                    self.src,
-                    "// Exported resource `{name}` — implement this class and"
-                )
-                .unwrap();
-                writeln!(
-                    self.src,
-                    "// add an optional `__onDrop()` method for cleanup."
-                )
-                .unwrap();
-                writeln!(self.src, "export class {cls} {{").unwrap();
-                writeln!(self.src, "  constructor() {{ /* user fields */ }}").unwrap();
-                writeln!(self.src, "  __onDrop(): void {{}}").unwrap();
-                writeln!(self.src, "}}").unwrap();
-                writeln!(self.src).unwrap();
+                let resource_name = name.to_string();
+                let resource_cls = cls.clone();
+                self.with_stub(|g| {
+                    writeln!(
+                        g.src,
+                        "// Exported resource `{resource_name}` — implement this class and"
+                    )
+                    .unwrap();
+                    writeln!(g.src, "// add an optional `__onDrop()` method for cleanup.").unwrap();
+                    writeln!(g.src, "export class {resource_cls} {{").unwrap();
+                    writeln!(g.src, "  constructor() {{ /* user fields */ }}").unwrap();
+                    writeln!(g.src, "  __onDrop(): void {{}}").unwrap();
+                    writeln!(g.src, "}}").unwrap();
+                    writeln!(g.src).unwrap();
+                });
+                self.stub_types.insert(cls.clone());
 
                 // The handle table + new/drop wrappers, inlined in the same file
                 // so they have direct access to the class:
@@ -3847,6 +4003,115 @@ mod tests {
         assert!(field(FutureIntrinsic::Write, true).contains("async-lower"));
         assert!(!field(FutureIntrinsic::CancelRead, false).contains("async-lower"));
         assert!(!field(FutureIntrinsic::CancelWrite, false).contains("async-lower"));
+    }
+
+    fn file<'a>(files: &'a Files, name: &str) -> &'a str {
+        files
+            .iter()
+            .find(|(path, _)| *path == name)
+            .map(|(_, contents)| std::str::from_utf8(contents).unwrap())
+            .unwrap_or_else(|| panic!("generated `{name}`; got {:?}", paths(files)))
+    }
+
+    fn paths(files: &Files) -> Vec<&str> {
+        files.iter().map(|(path, _)| path).collect()
+    }
+
+    const SPLIT_WIT: &str = r#"
+        package test:bindings;
+
+        interface api {
+            resource item {
+                constructor();
+            }
+            run: async func() -> u32;
+            plain: func(x: u32) -> u32;
+        }
+
+        world test-world {
+            export api;
+        }
+    "#;
+
+    /// Fixtures used to be copied over `exports/<iface>.ts`, replacing every
+    /// wasm-export wrapper, task base, and callback with a hand-written replica
+    /// — so no generated export glue was ever executed. The user's half now
+    /// lives in `stubs/<iface>.ts` and the glue imports it.
+    #[test]
+    fn export_glue_and_user_stub_live_in_separate_files() {
+        let files = generate(SPLIT_WIT, "test-world", Opts::default());
+
+        let glue = file(&files, "exports/test$bindings$api.ts");
+        let stub = file(&files, "stubs/test$bindings$api.ts");
+
+        // The glue owns everything the canonical ABI requires...
+        assert!(glue.contains("export function __exp_"));
+        assert!(glue.contains("export function __callback_"));
+        assert!(glue.contains("export function __finish___exp_"));
+        assert!(glue.contains("export class RunTask"));
+        assert!(
+            glue.contains("import { Item, item, plain, run } from \"../stubs/test$bindings$api\";")
+        );
+        // ...and nothing the user is meant to edit.
+        assert!(!glue.contains("// TODO: implement"));
+        assert!(!glue.contains("/* user fields */"));
+
+        // The stub owns only the user's half, and reaches the generated task
+        // base through the glue namespace.
+        assert!(stub.contains("export function run(): e_test$bindings$api.RunTask"));
+        assert!(stub.contains("return new e_test$bindings$api.RunTask();"));
+        assert!(stub.contains("export class Item"));
+        assert!(stub.contains("// TODO: implement"));
+        assert!(!stub.contains("__exp_"));
+        assert!(!stub.contains("__callback_"));
+
+        // Exported resource classes are re-exported so sibling files can still
+        // refer to them as `e_<basename>.<Type>`.
+        assert!(glue.contains("export { Item };"));
+    }
+
+    /// World-level exports follow the same split, with `world.ts` as the glue.
+    #[test]
+    fn world_level_exports_split_into_a_stub_file() {
+        let files = generate(
+            r#"
+                package test:bindings;
+
+                world test-world {
+                    export run: async func();
+                }
+            "#,
+            "test-world",
+            Opts::default(),
+        );
+
+        let glue = file(&files, "world.ts");
+        let stub = file(&files, "stubs/world.ts");
+        assert!(glue.contains("import { run } from \"./stubs/world\";"));
+        assert!(glue.contains("export class RunTask"));
+        assert!(stub.contains("export function run(): world.RunTask"));
+        assert!(!stub.contains("__exp_"));
+    }
+
+    /// `--ignore-stub` must preserve the user's file *only*. The generated glue
+    /// has to keep regenerating, or an ABI change would silently not apply.
+    #[test]
+    fn ignore_stub_skips_the_user_file_but_regenerates_the_glue() {
+        let files = generate(
+            SPLIT_WIT,
+            "test-world",
+            Opts {
+                ignore_stub: true,
+                ..Opts::default()
+            },
+        );
+
+        assert!(
+            !paths(&files).iter().any(|p| p.starts_with("stubs/")),
+            "no stub file may be written under --ignore-stub; got {:?}",
+            paths(&files)
+        );
+        assert!(file(&files, "exports/test$bindings$api.ts").contains("export function __exp_"));
     }
 
     #[test]

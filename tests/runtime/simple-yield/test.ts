@@ -1,14 +1,15 @@
 //@ [lang]
-//@ path = "exports/a$b$i.ts"
+//@ path = "stubs/a$b$i.ts"
 
 import * as async_ from "../async";
+import * as e_a$b$i from "../exports/a$b$i";
 
 function assertEq<T>(actual: T, expected: T): void {
   if (actual != expected) unreachable();
 }
 
 @unmanaged
-class YieldTask extends FTask {
+class YieldTask extends e_a$b$i.FTask {
   private state: i32 = 0;
 
   resume(event: i32, waitable: i32, code: i32): i32 {
@@ -35,40 +36,6 @@ class YieldTask extends FTask {
   }
 }
 
-export function f(): FTask {
+export function f(): e_a$b$i.FTask {
   return new YieldTask();
-}
-
-export function __exp_0_f(): i32 {
-  const status = async_.Scheduler.start(f());
-  __finish___exp_0_f(status);
-  return status;
-}
-
-@external("[export]a:b/i", "[task-return]f")
-declare function __task_return_0_f(): void;
-
-@unmanaged
-export abstract class FTask extends async_.AsyncTask {
-  finished: bool = false;
-
-  finish(): i32 {
-    this.finished = true;
-    return async_.CALLBACK_CODE_EXIT;
-  }
-}
-
-@inline(false)
-export function __finish___exp_0_f(status: i32): void {
-  const task = async_.contextGet();
-  if (status != async_.CALLBACK_CODE_EXIT || task == 0) return;
-  if (load<bool>(task + offsetof<FTask>("finished"))) __task_return_0_f();
-  async_.Scheduler.release(task);
-  async_.Scheduler.complete(task);
-}
-
-export function __callback_0_f(event: i32, waitable: i32, code: i32): i32 {
-  const status = async_.Scheduler.resume(event, waitable, code);
-  __finish___exp_0_f(status);
-  return status;
 }
