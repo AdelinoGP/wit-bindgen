@@ -312,6 +312,33 @@ default `args` option for bindings generator options
 Here the crate will be compiled with `-O` and `./other.rs` will be compiled as a
 separate crate and passed as `--extern`
 
+#### Configuration: AssemblyScript
+
+AssemblyScript generates two files per exported interface: the glue, which is
+always regenerated, and a user-implementation stub. `path` says which generated
+stub this fixture replaces:
+
+```rust
+//@ [lang]
+//@ path = "stubs/test$records$to_test.ts"
+```
+
+A world exporting several interfaces needs one stub per interface. Split the
+fixture with `// @@file: <path>` marker lines: everything before the first
+marker goes to `path`, and each following section goes to the path its marker
+names.
+
+```ts
+//@ [lang]
+//@ path = "stubs/my$inline$foo1.ts"
+
+export function foo(): void {}
+
+// @@file: stubs/my$inline$foo2.ts
+
+export function foo(): void {}
+```
+
 #### Configuration: C
 
 C/C++ configuration supports configuring compilation and linker flags at this time:

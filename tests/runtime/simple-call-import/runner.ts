@@ -12,31 +12,17 @@ function assert(condition: bool): void {
 
 @unmanaged
 class RunTask extends world.RunTask {
-  private set: i32 = 0;
-  private pending: usize = 0;
-
   resume(event: i32, waitable: i32, code: i32): i32 {
-    if (this.pending != 0) {
-      const subtask = changetype<I.FSubtask>(this.pending);
-      assert(event == async_.EVENT_SUBTASK && waitable == subtask.handle);
-      assert(async_.subtaskState(code) == async_.STATUS_RETURNED);
-      this.pending = 0;
-      subtask.finish(code);
-      async_.waitableSetDrop(this.set);
-      this.set = 0;
-      return this.finish();
-    }
-
     assert(event == async_.EVENT_NONE && waitable == 0 && code == 0);
+
+    // The callee completes inside the initial call, so the subtask returns
+    // without ever becoming a waitable — the same property `runner.c` pins.
     const subtask = I.f();
-    if (subtask.handle == 0) {
-      subtask.finish(subtask.status);
-      return this.finish();
-    }
-    this.set = async_.waitableSetNew();
-    async_.waitableJoin(subtask.handle, this.set);
-    this.pending = changetype<usize>(subtask);
-    return async_.callbackWait(this.set);
+    assert(subtask.state == async_.STATUS_RETURNED);
+    assert(subtask.handle == 0);
+    subtask.finish(subtask.status);
+
+    return this.finish();
   }
 }
 

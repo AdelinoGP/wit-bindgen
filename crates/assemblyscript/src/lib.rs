@@ -814,22 +814,7 @@ impl<'a> InterfaceGenerator<'a> {
             TypeDefKind::Handle(Handle::Own(resource_id))
             | TypeDefKind::Handle(Handle::Borrow(resource_id)) => self.named_type_ref(*resource_id),
             TypeDefKind::Type(t) => self.type_ref(t),
-            TypeDefKind::List(elem) => {
-                let inner = self.type_ref(elem);
-                match elem {
-                    Type::U8 => "Uint8Array".into(),
-                    Type::S8 => "Int8Array".into(),
-                    Type::U16 => "Uint16Array".into(),
-                    Type::S16 => "Int16Array".into(),
-                    Type::U32 => "Uint32Array".into(),
-                    Type::S32 => "Int32Array".into(),
-                    Type::U64 => "Uint64Array".into(),
-                    Type::S64 => "Int64Array".into(),
-                    Type::F32 => "Float32Array".into(),
-                    Type::F64 => "Float64Array".into(),
-                    _ => format!("Array<{inner}>"),
-                }
-            }
+            TypeDefKind::List(elem) => self.list_type_ref(elem),
             TypeDefKind::Option(inner) => {
                 let it = self.type_ref(inner);
                 format!("ffi.Option<{it}>")
@@ -1470,9 +1455,9 @@ impl<'a> InterfaceGenerator<'a> {
         // below imports it by name. Signature types must be re-resolved in stub
         // scope, where this interface's own types live behind the glue
         // namespace.
-        self.emitting_stub = true;
+        let was_stub = mem::replace(&mut self.emitting_stub, true);
         let stub_sig = self.func_signature(func, variant);
-        self.emitting_stub = false;
+        self.emitting_stub = was_stub;
         let docs = func.docs.clone();
         let user = user_ident.clone();
         let glue_ns = self.glue_ns();
@@ -1528,7 +1513,10 @@ impl<'a> InterfaceGenerator<'a> {
         let mut wrapper_body = String::new();
 
         if is_async {
-            let arg_count = async_params.as_ref().map(|p| p.0.len()).unwrap_or(0);
+            let arg_count = async_params
+                .as_ref()
+                .map(|p| p.arg_types.len())
+                .unwrap_or(0);
             let mut bindgen = FunctionBindgen::new(
                 self,
                 func,
@@ -1619,7 +1607,7 @@ impl<'a> InterfaceGenerator<'a> {
                 func,
                 &func_local,
                 &user_ident,
-                async_params.as_ref().map(|p| p.1.as_str()).unwrap_or(""),
+                async_params.as_ref().map(|p| p.body.as_str()).unwrap_or(""),
             );
         } else {
             self.emit_post_return(func, &func_local);
@@ -1637,7 +1625,7 @@ impl<'a> InterfaceGenerator<'a> {
         &mut self,
         func: &Function,
         user_ident: &str,
-    ) -> Option<(Vec<WasmType>, String)> {
+    ) -> Option<AsyncParamCleanup> {
         let types: Vec<Type> = func.params.iter().map(|p| p.ty).collect();
         if types.is_empty() {
             return None;
@@ -1679,12 +1667,13 @@ impl<'a> InterfaceGenerator<'a> {
         if body.trim().is_empty() {
             return None;
         }
-        Some((arg_types, body))
+        Some(AsyncParamCleanup { arg_types, body })
     }
 
     /// Release what the caller transferred with a synchronous export's
-    /// parameters: list and string buffers (lifting copies them, so nothing
-    /// else frees them), error contexts, and owned handles.
+    /// parameters. See `FunctionBindgen::export_param_cleanup` for exactly what
+    /// that covers: list and string buffers, plus owned handles to resources
+    /// this world exports.
     ///
     /// Emitted immediately after the user call rather than before the return,
     /// so that an owned exported-resource parameter handed straight back as the
@@ -1783,7 +1772,7 @@ impl<'a> InterfaceGenerator<'a> {
         func: &Function,
         func_local: &str,
         sig: &FuncSig,
-        async_params: Option<&(Vec<WasmType>, String)>,
+        async_params: Option<&AsyncParamCleanup>,
     ) {
         let task_type = format!("{}Task", ident::type_name(func_local));
         let (_, _, task_return_sig) =
@@ -1803,14 +1792,14 @@ impl<'a> InterfaceGenerator<'a> {
         writeln!(self.src, "    return async_.CALLBACK_CODE_EXIT;").unwrap();
         writeln!(self.src, "  }}").unwrap();
         writeln!(self.src, "  finished: bool = false;").unwrap();
-        if let Some((arg_types, _)) = async_params {
+        if let Some(async_params) = async_params {
             writeln!(
                 self.src,
                 "  // Raw arguments, kept so the finish helper can release what"
             )
             .unwrap();
             writeln!(self.src, "  // the caller transferred with them.").unwrap();
-            for (i, ty) in arg_types.iter().enumerate() {
+            for (i, ty) in async_params.arg_types.iter().enumerate() {
                 writeln!(self.src, "  __arg{i}: {} = 0;", wasm_type_name(*ty)).unwrap();
             }
         }
@@ -2533,6 +2522,14 @@ impl EndpointIntrinsic {
     }
 }
 
+/// How an async export releases the parameters its task owns.
+struct AsyncParamCleanup {
+    /// Raw wasm argument types the task base persists as `__arg<i>` fields.
+    arg_types: Vec<WasmType>,
+    /// Body the finish helper runs, reading those fields back.
+    body: String,
+}
+
 struct FuncSig {
     params: Vec<(String, String)>,
     return_type: Option<String>,
@@ -3046,21 +3043,8 @@ impl<'a> CoreInterfaceGenerator<'a> for InterfaceGenerator<'a> {
     fn type_list(&mut self, _id: TypeId, name: &str, ty: &Type, docs: &Docs) {
         self.docs(docs);
         let cls = ident::type_name(name);
-        let t = self.type_ref(ty);
         // Use the per-element-type AS-native typed array where applicable.
-        let aliased = match ty {
-            Type::U8 => "Uint8Array".into(),
-            Type::S8 => "Int8Array".into(),
-            Type::U16 => "Uint16Array".into(),
-            Type::S16 => "Int16Array".into(),
-            Type::U32 => "Uint32Array".into(),
-            Type::S32 => "Int32Array".into(),
-            Type::U64 => "Uint64Array".into(),
-            Type::S64 => "Int64Array".into(),
-            Type::F32 => "Float32Array".into(),
-            Type::F64 => "Float64Array".into(),
-            _ => format!("Array<{t}>"),
-        };
+        let aliased = self.list_type_ref(ty);
         writeln!(self.src, "export type {cls} = {aliased};").unwrap();
         writeln!(self.src).unwrap();
     }
@@ -3735,6 +3719,13 @@ impl<'a, 'b> Bindgen for FunctionBindgen<'a, 'b> {
                     let ty = &self.iface_gen.resolve.types[res_id];
                     let res_name = ty.name.clone().unwrap_or_default();
                     let safe = sanitize_extern_local(&ident::type_name(&res_name));
+                    // `_take` mints an *owned* handle, which is right for
+                    // `own<T>`. For `borrow<T>` it would be wrong — the callee
+                    // would drop the handle we minted, running the destructor
+                    // while the guest still holds the instance. No world
+                    // reaches that here: WIT forbids returning a borrow, and an
+                    // import taking one resolves to the *imported* view of the
+                    // resource, which takes the branch below.
                     results.push(format!("{prefix}__{safe}_take({})", operands[0]));
                 } else {
                     results.push(format!("{}.handle", operands[0]));
@@ -4882,10 +4873,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "arity 17 > 16")]
     fn tuples_wider_than_sixteen_are_rejected() {
-        let types = (0..17)
-            .map(|i| format!("t{i}: u8"))
-            .collect::<Vec<_>>()
-            .join(", ");
         generate(
             &format!(
                 r#"
@@ -4896,8 +4883,7 @@ mod tests {
                 }}
                 "#,
                 vec!["u8"; 17].join(", ")
-            )
-            .replace("UNUSED", &types),
+            ),
             "test-world",
             Opts::default(),
         );

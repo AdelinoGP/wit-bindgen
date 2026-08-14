@@ -224,14 +224,29 @@ Skip the language-specific dirs (`c`, `cpp`, `rust`, `moonbit`, `demo`,
   import is still not released. `ListLower` only queues its cleanup at the top
   level, because a nested list's buffer and length are loop-locals that no
   longer exist after the call. See the comment at the `realloc.is_none()` guard.
-- Lowering a `borrow<T>` of an **exported** resource out to an import mints a
-  fresh owned handle with `__X_take` and never drops it. Rare shape; no fixture
-  reaches it.
+- Lowering a `borrow<T>` of an **exported** resource mints a fresh *owned*
+  handle with `__X_take`. That is worse than a leak: the callee would drop the
+  handle, running the destructor while the guest still holds the instance. It is
+  the mirror of the lift-side bug `24015cd3` fixed. No world reaches it today —
+  WIT forbids returning a borrow, and an import taking one resolves to the
+  *imported* view of the resource — so the branch is noted at the `HandleLower`
+  site rather than fixed with an instance-to-rep map that nothing would use.
 - `abi.rs` unrolls fixed-length-list deallocation rather than using a block plus
   `IterBasePointer`. Correct, but a code-size hazard in every backend. Folding
   it into a loop needs a new core instruction that every backend must implement.
 
-## 4. Smaller items
+## 4. Error contexts have no runtime coverage
+
+The previous handoff asked to "add a runtime fixture (there is no
+`tests/runtime/error-context/`; the earlier experiment was deleted)". Still
+absent. The unit test is honest now — it asserts that the export does *not* drop
+a parameter, because `round-trip: func(context: error-context) -> error-context`
+hands it straight back — but nothing exercises an error context end to end, and
+under the ownership contract a user who forgets `drop()` leaks with no
+diagnostic. Creating the directory means writing the WIT and a Rust counterpart
+too.
+
+## 5. Smaller items
 
 - `async.ts` single-instance return areas (`memory.data(8)`, `memory.data(16)`)
   are documented as non-re-entrant but not made safe.
@@ -239,7 +254,20 @@ Skip the language-specific dirs (`c`, `cpp`, `rust`, `moonbit`, `demo`,
   still hands out raw endpoint helpers.
 - `crates/test/src/assemblyscript.rs` splits a fixture on `// @@file: <path>`
   markers so one file can supply the several stubs a multi-interface world
-  needs. It is AssemblyScript-only; other languages would need their own.
+  needs (documented in `crates/test/README.md`). Rust solves the same problem
+  with `externs = ['./other.rs']`; the two conventions have not been unified.
+- Review debt, all judgement calls: `sync_export_param_cleanup` and
+  `async_export_param_cleanup` share a six-step shape that could be one
+  function; `render_interface_file`/`render_stub_file` share their import
+  preamble; the `kind: &str` in {"imports","exports","world"} is switched on in
+  three places and wants an enum; `FunctionBindgen` now configures four fields
+  by assignment after `new`; `lib.rs` is at ~5600 lines and, like
+  `crates/rust`, could split its `Bindgen` impl into its own module.
+- Fixture debt: 25 `.ts` fixtures each redeclare `function assert`, which the
+  Rust and C fixtures get from `std`/`<assert.h>` — a shared AssemblyScript test
+  prelude has no obvious home, since each fixture is copied into its own
+  bindings directory. New fixtures also mix short import aliases (`I`, `E`)
+  with the mangled `i_<iface>` form the older ones use.
 
 ---
 
